@@ -126,6 +126,10 @@
       <div class="label">运行预设</div>
       <div id="presets"></div>
     </div>
+    <div class="group">
+      <div class="label">思考强度</div>
+      <div id="reasoning"></div>
+    </div>
   </div>
 
   <div id="controls">
@@ -172,12 +176,19 @@ const $ = (id) => document.getElementById(id);
 let CATALOGUE = null;
 let selModel = null;
 let selPreset = null;
+let selReasoning = 'medium';
 let busy = false;
 
 function fmtUptime(s) {
   if (!s) return '—';
   const m = Math.floor(s / 60);
   return m < 1 ? `${s} 秒` : `${m} 分 ${s % 60} 秒`;
+}
+
+function reasonLabel(key) {
+  const list = (CATALOGUE && CATALOGUE.reasoning) || [];
+  const hit = list.find((r) => r.key === key);
+  return hit ? hit.label : (key || '—');
 }
 
 function renderModels() {
@@ -212,6 +223,31 @@ function renderPresets() {
   }
 }
 
+function renderReasoning() {
+  const box = $('reasoning');
+  box.innerHTML = '';
+  for (const r of (CATALOGUE.reasoning || [])) {
+    const b = document.createElement('button');
+    b.className = 'item' + (r.key === selReasoning ? ' sel' : '');
+    b.innerHTML = `<div class="t">${r.label}</div>
+      <div class="d">${r.hint}${r.flag ? ' · --reasoning-effort ' + r.flag : ''}</div>`;
+    b.onclick = () => { selReasoning = r.key; saveReasoning(); renderReasoning(); refreshButtons(); };
+    box.appendChild(b);
+  }
+}
+
+// Persist the choice: it is the setting most likely to change between runs.
+function saveReasoning() {
+  try { localStorage.setItem('llama-shell.reasoning', selReasoning); } catch (e) { /* ignore */ }
+}
+function loadReasoning() {
+  try {
+    const v = localStorage.getItem('llama-shell.reasoning');
+    if (v && (CATALOGUE.reasoning || []).some((r) => r.key === v)) return v;
+  } catch (e) { /* ignore */ }
+  return 'medium';
+}
+
 function refreshButtons() {
   $('btnStart').disabled = busy || !selModel || !selPreset;
   $('btnStart').textContent = busy ? '启动中…' : '启动';
@@ -228,7 +264,8 @@ async function refresh() {
     setDot('on', '运行中');
     $('stCtx').textContent = s.ctx ? s.ctx.toLocaleString() + ' tokens' : '—';
     $('stUp').textContent = fmtUptime(s.uptimeSec);
-    $('barText').textContent = `${s.modelName || ''} · ${s.preset || ''}`;
+    $('barText').textContent = `${s.modelName || ''} · ${s.preset || ''}` +
+      (s.reasoning ? ` · 思考:${reasonLabel(s.reasoning)}` : '');
     $('btnStop').disabled = false;
     $('btnReload').disabled = false;
     $('btnOpen').disabled = false;
@@ -291,7 +328,7 @@ function initFrameDiagnostics() {
 
 async function doStart() {
   busy = true; refreshButtons(); setDot('busy', '启动中');
-  const r = await window.shell.start(selModel, selPreset);
+  const r = await window.shell.start(selModel, selPreset, selReasoning);
   busy = false; refreshButtons();
   if (!r.ok) {
     setDot('err', '启动失败');
@@ -321,7 +358,8 @@ async function showLogs() {
   // preselect the first available model
   const first = CATALOGUE.models.find((m) => m.present);
   if (first) { selModel = first.id; selPreset = first.defaultPreset; }
-  renderModels(); renderPresets(); refreshButtons();
+  selReasoning = loadReasoning();
+  renderModels(); renderPresets(); renderReasoning(); refreshButtons();
   await refresh();
 
   $('btnStart').onclick = doStart;

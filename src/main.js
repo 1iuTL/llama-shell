@@ -1,4 +1,4 @@
-// llama-shell -- a minimal Electron shell around llama-server.
+﻿// llama-shell -- a minimal Electron shell around llama-server.
 //
 // Responsibilities:
 //   1. pick a model + preset
@@ -14,14 +14,14 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 
-const { MODELS, PRESETS, buildArgs } = require('./config');
+const { MODELS, PRESETS, REASONING, buildArgs } = require('./config');
 
 const PORT = 8091;
 const BASE = `http://127.0.0.1:${PORT}`;
 
 let win = null;
 let child = null;
-let current = { modelId: null, preset: null, startedAt: null };
+let current = { modelId: null, preset: null, reasoning: null, startedAt: null };
 let logFile = null;
 
 // The child's output goes to a file rather than a pipe on purpose.
@@ -81,28 +81,28 @@ function binExists(model) {
 
 function stopServer() {
   return new Promise((resolve) => {
-    if (!child) { current = { modelId: null, preset: null, startedAt: null }; return resolve(); }
+    if (!child) { current = { modelId: null, preset: null, reasoning: null, startedAt: null }; return resolve(); }
     const dying = child;
     child = null;
     try {
       dying.kill();
     } catch { /* already gone */ }
-    const done = () => { current = { modelId: null, preset: null, startedAt: null }; resolve(); };
+    const done = () => { current = { modelId: null, preset: null, reasoning: null, startedAt: null }; resolve(); };
     // Escalate to a hard kill if it lingers.
     const t = setTimeout(() => { try { dying.kill('SIGKILL'); } catch {} ; done(); }, 8000);
     dying.once('exit', () => { clearTimeout(t); done(); });
   });
 }
 
-async function startServer(modelId, presetKey) {
+async function startServer(modelId, presetKey, reasoningKey) {
   await stopServer();
 
   const model = MODELS.find((m) => m.id === modelId);
-  if (!model) throw new Error(`未知模型: ${modelId}`);
-  if (!modelExists(model)) throw new Error(`模型文件不存在:\n${model.file}`);
-  if (!binExists(model)) throw new Error(`llama-server 不存在:\n${model.bin}`);
+  if (!model) throw new Error(`鏈煡妯″瀷: ${modelId}`);
+  if (!modelExists(model)) throw new Error(`妯″瀷鏂囦欢涓嶅瓨鍦?\n${model.file}`);
+  if (!binExists(model)) throw new Error(`llama-server 涓嶅瓨鍦?\n${model.bin}`);
 
-  const args = buildArgs(model, presetKey, PORT);
+  const args = buildArgs(model, presetKey, PORT, reasoningKey);
 
   fs.mkdirSync(LOG_DIR, { recursive: true });
   logFile = path.join(LOG_DIR, `shell-${modelId}.log`);
@@ -117,7 +117,7 @@ async function startServer(modelId, presetKey) {
     detached: true,
     stdio: ['ignore', out, out],
   });
-  current = { modelId, preset: presetKey, startedAt: Date.now() };
+  current = { modelId, preset: presetKey, reasoning: reasoningKey || 'medium', startedAt: Date.now() };
 
   // The child has its own handles now; holding ours would leak one fd per start.
   try { fs.closeSync(out); } catch {}
@@ -129,7 +129,7 @@ async function startServer(modelId, presetKey) {
 
   child.on('exit', (code) => {
     try { fs.appendFileSync(logFile, `[shell] server exited with code ${code}\n`); } catch {}
-    if (child) { child = null; current = { modelId: null, preset: null, startedAt: null }; }
+    if (child) { child = null; current = { modelId: null, preset: null, reasoning: null, startedAt: null }; }
     notifyRenderer();
   });
 
@@ -137,7 +137,7 @@ async function startServer(modelId, presetKey) {
   if (!ok) {
     const tail = readLogTail(14).join('\n');
     await stopServer();
-    throw new Error(`服务启动失败或超时。日志末尾:\n${tail}`);
+    throw new Error(`鏈嶅姟鍚姩澶辫触鎴栬秴鏃躲€傛棩蹇楁湯灏?\n${tail}`);
   }
   try { fs.appendFileSync(logFile, '[shell] server ready\n'); } catch {}
   return { url: `${BASE}/`, modelId, preset: presetKey };
@@ -182,15 +182,18 @@ ipcMain.handle('catalogue', () => ({
     present: modelExists(m),
     binPresent: binExists(m),
   })),
+  reasoning: Object.entries(REASONING).map(([k, v]) => ({
+    key: k, label: v.label, hint: v.hint, flag: v.flag,
+  })),
   presets: Object.entries(PRESETS).map(([k, v]) => ({
     key: k, label: v.label, hint: v.hint, ctx: v.ctx, vision: v.vision,
   })),
   port: PORT,
 }));
 
-ipcMain.handle('start', async (_e, { modelId, preset }) => {
+ipcMain.handle('start', async (_e, { modelId, preset, reasoning }) => {
   try {
-    const r = await startServer(modelId, preset);
+    const r = await startServer(modelId, preset, reasoning);
     return { ok: true, ...r };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -212,6 +215,7 @@ ipcMain.handle('status', async () => {
     modelId: current.modelId,
     modelName: model ? model.name : null,
     preset: current.preset,
+    reasoning: current.reasoning,
     ctx,
     uptimeSec: current.startedAt ? Math.floor((Date.now() - current.startedAt) / 1000) : 0,
     url: health.ok ? `${BASE}/` : null,
@@ -230,7 +234,7 @@ app.whenReady().then(async () => {
   // without clicking anything; harmless when the variable is unset.
   const auto = process.env.LLAMA_SHELL_AUTOSTART;
   if (auto) {
-    const [modelId, preset] = auto.split(':');
+    const [modelId, preset, reasoning] = auto.split(':');
     // Wait for the window to finish loading so the renderer exists before we
     // start emitting state changes.
     try {
@@ -242,14 +246,14 @@ app.whenReady().then(async () => {
     } catch {}
     console.log('[shell] autostart', modelId, preset);
     try {
-      await startServer(modelId, preset);
+      await startServer(modelId, preset, reasoning);
       console.log('[shell] autostart OK');
       notifyRenderer();
     } catch (e) {
       console.error('[shell] autostart FAILED:', e.message);
       if (win && !win.isDestroyed()) {
         win.webContents.executeJavaScript(
-          `alert(${JSON.stringify('自测启动失败:\n\n' + e.message)})`).catch(() => {});
+          `alert(${JSON.stringify('鑷祴鍚姩澶辫触:\n\n' + e.message)})`).catch(() => {});
       }
     }
   }
@@ -264,3 +268,4 @@ app.on('window-all-closed', async () => {
 app.on('before-quit', () => {
   if (child) { try { child.kill(); } catch {} }
 });
+

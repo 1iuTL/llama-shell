@@ -4,7 +4,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 
 contextBridge.exposeInMainWorld('shell', {
   catalogue: () => ipcRenderer.invoke('catalogue'),
-  start: (modelId, preset) => ipcRenderer.invoke('start', { modelId, preset }),
+  start: (modelId, preset, reasoning) => ipcRenderer.invoke('start', { modelId, preset, reasoning }),
   stop: () => ipcRenderer.invoke('stop'),
   status: () => ipcRenderer.invoke('status'),
   logs: () => ipcRenderer.invoke('logs'),

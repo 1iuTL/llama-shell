@@ -51,6 +51,21 @@ const PRESETS = {
   },
 };
 
+// Thinking levels the sidebar can request, mapped to llama-server's flag.
+//
+// This is deliberately user-selectable rather than hardcoded. An earlier
+// version pinned `--reasoning-effort medium` unconditionally, which silently
+// overrode whatever thinking level the chat UI sent -- picking "high" still
+// produced shallow thinking. Pass 'server-default' to send no flag at all and
+// let the model's own chat template decide.
+const REASONING = {
+  'server-default': { label: '跟随模型默认', hint: '不加参数,由模板决定', flag: null },
+  off: { label: '关闭思考', hint: '最快,不产出思考内容', flag: 'none' },
+  low: { label: '低', hint: '浅思考', flag: 'low' },
+  medium: { label: '中', hint: '推荐起点', flag: 'medium' },
+  high: { label: '高', hint: '深思考,更慢', flag: 'high' },
+};
+
 // Every model here was downloaded and verified in this workspace.
 const MODELS = [
   {
@@ -100,9 +115,11 @@ const MODELS = [
  *   --jinja             tool calls
  *   --temp/--top-p/--top-k  the model card's thinking-mode sampling values
  */
-function buildArgs(model, presetKey, port) {
+function buildArgs(model, presetKey, port, reasoningKey) {
   const preset = PRESETS[presetKey];
   if (!preset) throw new Error('unknown preset: ' + presetKey);
+
+  const reasoning = REASONING[reasoningKey] || REASONING['medium'];
 
   const args = [
     '-m', model.file,
@@ -113,7 +130,6 @@ function buildArgs(model, presetKey, port) {
     '-ctk', 'q4_0',
     '-ctv', 'q4_0',
     '--jinja',
-    '--reasoning-effort', 'medium',
     '--temp', '1.0',
     '--top-p', '0.95',
     '--top-k', '20',
@@ -121,10 +137,17 @@ function buildArgs(model, presetKey, port) {
     '--port', String(port),
   ];
 
+  // Only sent when the user actually picked a level. 'server-default' leaves the
+  // model's own template in charge -- important, because several templates
+  // default to their highest level and would otherwise ignore a UI selector.
+  if (reasoning.flag) {
+    args.push('--reasoning-effort', reasoning.flag);
+  }
+
   if (preset.vision) {
     args.push('--mmproj', MMPROJ, '--no-mmproj-offload', '--image-max-tokens', '1024');
   }
   return args;
 }
 
-module.exports = { MODELS, PRESETS, BIN, MMPROJ, MODELS_DIR, buildArgs };
+module.exports = { MODELS, PRESETS, REASONING, BIN, MMPROJ, MODELS_DIR, buildArgs };
