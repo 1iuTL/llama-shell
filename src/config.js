@@ -24,14 +24,23 @@ const BIN = {
 
 // 思考强度的 token 上限。
 //
-// 为什么必须有这个上限:llama-server 的 --reasoning-budget 默认是 **-1(无限)**,
-// 而部分模型的聊天模板默认又是最高档思考。两者一叠加,简单问题也可能让模型
-// 无限"想"下去 —— 界面上表现为 reasoning 区一直刷同一个字符,永远不产出答案。
+// llama-server 的 --reasoning-budget 默认是 **-1(无限)**。这是一道**保险**,
+// 不是常态约束:目的是万一模型陷进重复生成(实测见过 reasoning 区一直刷同一个
+// 字符、几十秒不产出答案),有个兜底能自己收住,而不是必须手动停服务。
 //
-// 4096 的依据:实测那次失控在 186 token / 52 秒时还在跑(186 token 本身不多,
-// 问题是它不肯停),正常问答的思考通常远小于这个数。给够空间,但到点必须收。
-// 想完全不限制可以设成 -1,但一般不建议 —— 除非你在专门测模型的思考上限。
-const REASONING_BUDGET = 4096;
+// 取值原则:要宽到让难题的深度思考跑完,只在真正失控时才触发。
+// 64K 上下文里 32768 约占一半,足够长链推理;想完全不干预就选「不限」。
+//
+// 注意别把它和"思考档位"混为一谈:档位由 --reasoning-effort 控制,预算只
+// 限制总长度。两者独立。
+const REASONING_BUDGETS = [
+  { key: 'unlimited', label: '不限', hint: '不干预,完全由模型自己决定何时停', value: -1 },
+  { key: '8192', label: '8K', hint: '较紧,适合快问快答', value: 8192 },
+  { key: '32768', label: '32K', hint: '推荐:难题够用,又能兜住失控', value: 32768 },
+  { key: '65536', label: '64K', hint: '几乎等同不限', value: 65536 },
+];
+
+const DEFAULT_REASONING_BUDGET = '32768';
 
 // 预算耗尽时注入的收尾提示。不设的话模型可能被硬截断在思考中途,
 // 拿到半截思考而没有答案;给了这句它会转向作答。
@@ -148,16 +157,16 @@ const MODELS = [
  *
  * apiKey 非空时加 --api-key,所有接口都要带 Authorization: Bearer <key>。
  *
- * 另外无条件加 --reasoning-budget(除非思考档位是 off)。llama-server 那个
- * 参数默认 -1 = 无限,配合"模板默认最高档思考"的模型会让简单问题也停不下来,
- * 界面上就是 reasoning 一直刷、永远不出答案。详见 REASONING_BUDGET 的注释。
+ * 另外按 reasoningBudgetKey 加 --reasoning-budget。这是一道保险,防止模型
+ * 陷入重复生成后停不下来;默认 32K,想完全不干预可以选「不限」。
+ * 详见 REASONING_BUDGETS 的注释。
  *
  * 关于 API Key 与网页界面:llama.cpp 自带的 Web UI **认识**这个 Key ——
  * 检测到 401 会弹一个输入框,校验通过就存进浏览器 localStorage,之后免输。
  * 所以手机只需输一次。注意 / 这个页面本身是放行的(不然连输入框都拿不到),
  * 被挡住的是 /v1/* 与 /props 这些真正的接口。
  */
-function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey) {
+function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budgetKey) {
   const preset = PRESETS[presetKey];
   if (!preset) throw new Error('未知的预设: ' + presetKey);
 
@@ -188,11 +197,14 @@ function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey) {
   // 绑到网络上时关掉。
   if (lanMode) args.push('--no-slots');
 
-  // 思考预算:不加上限的话,模型可能一直"想"下去不产出答案。
-  // 关掉思考档位(reasoningKey === 'off')时不加,那种情况下本就不会思考。
+  // 思考预算。'off' 档位下模型本就不思考,不必加。
+  // 预算为 -1(不限)时也不加参数,保持 llama-server 默认行为。
   if (reasoningKey !== 'off') {
-    args.push('--reasoning-budget', String(REASONING_BUDGET));
-    args.push('--reasoning-budget-message', REASONING_BUDGET_MESSAGE);
+    const budget = resolveBudget(budgetKey);
+    if (budget.value >= 0) {
+      args.push('--reasoning-budget', String(budget.value));
+      args.push('--reasoning-budget-message', REASONING_BUDGET_MESSAGE);
+    }
   }
 
   // 只在真的设了 Key 时才加。留空表示不鉴权 —— 局域网模式下等于
@@ -205,7 +217,16 @@ function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey) {
   return args;
 }
 
+/** 把预算键名解析成具体档位;键名缺失或无效时回落到默认档。 */
+function resolveBudget(key) {
+  if (key) {
+    const hit = REASONING_BUDGETS.find((b) => b.key === key);
+    if (hit) return hit;
+  }
+  return REASONING_BUDGETS.find((b) => b.key === DEFAULT_REASONING_BUDGET) || REASONING_BUDGETS[0];
+}
+
 module.exports = {
-  MODELS, PRESETS, REASONING, BIN, MMPROJ, MODELS_DIR, buildArgs,
-  REASONING_BUDGET,
+  MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET,
+  BIN, MMPROJ, MODELS_DIR, buildArgs, resolveBudget,
 };

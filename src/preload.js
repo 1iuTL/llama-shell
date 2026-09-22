@@ -5,9 +5,11 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('shell', {
   /** 取模型 / 预设 / 思考强度清单。 */
   catalogue: () => ipcRenderer.invoke('catalogue'),
-  /** 启动服务。reasoning 为思考强度键名;lanMode 为 true 时监听 0.0.0.0。 */
-  start: (modelId, preset, reasoning, lanMode) =>
-    ipcRenderer.invoke('start', { modelId, preset, reasoning, lanMode }),
+  /** 启动服务。
+   *  reasoning 为思考强度键名;lanMode 为 true 时监听 0.0.0.0;
+   *  budget 为思考预算键名(见 catalogue 的 budgets),缺省用默认档。 */
+  start: (modelId, preset, reasoning, lanMode, budget) =>
+    ipcRenderer.invoke('start', { modelId, preset, reasoning, lanMode, budget }),
   /** 停止当前服务。 */
   stop: () => ipcRenderer.invoke('stop'),
   /** 查询运行状态(是否在跑 / 上下文 / 运行时长)。 */

@@ -284,6 +284,10 @@
       <div class="label">思考强度</div>
       <div id="reasoning"></div>
     </div>
+    <div class="group" id="budgetGroup">
+      <div class="label">思考预算 <span id="budgetNote" style="text-transform:none;letter-spacing:0"></span></div>
+      <div id="budgets"></div>
+    </div>
   </div>
 
   <div id="controls">
@@ -336,6 +340,8 @@ let CATALOGUE = null;
 let selModel = null;
 let selPreset = null;
 let selReasoning = 'medium';
+// 思考预算键名。默认由主进程给(32K),用户可改成「不限」。
+let selBudget = null;
 let busy = false;
 let loadedUrl = null;
 let frameFailed = false;
@@ -344,6 +350,7 @@ let SERVICE_RUNNING = false;
 
 const REASONING_STORE_KEY = 'model-stove.reasoning';
 const SHOW_REASONING_KEY = 'model-stove.showReasoning';
+const BUDGET_STORE_KEY = 'model-stove.budget';
 
 // 侧栏的「思考强度」默认隐藏。
 //
@@ -439,6 +446,55 @@ function renderReasoning() {
     b.onclick = () => { selReasoning = r.key; saveReasoning(); renderReasoning(); refreshButtons(); };
     box.appendChild(b);
   }
+}
+
+/**
+ * 思考预算选择器。
+ *
+ * 这是一道**保险**,不是常态约束:llama-server 默认不限(-1),而模型偶尔会陷进
+ * 重复生成(见过 reasoning 区一直刷同一个字符)。给个上限就能自己收住,
+ * 不必手动停服务。默认 32K —— 宽到让难题的深度思考跑完,只在真失控时触发。
+ * 想要完全不干预就选「不限」。
+ *
+ * 注意与「思考强度」的区别:那个管**多深**(--reasoning-effort),这个管**多长**。
+ */
+function renderBudgets() {
+  const box = $('budgets');
+  box.innerHTML = '';
+  const list = CATALOGUE.budgets || [];
+  for (const b of list) {
+    const el = document.createElement('button');
+    el.className = 'item' + (b.key === selBudget ? ' sel' : '');
+    el.innerHTML = `<div class="t">${b.label}</div><div class="d">${b.hint}</div>`;
+    el.onclick = () => {
+      selBudget = b.key;
+      saveBudget();
+      renderBudgets();
+      budgetHint();
+      refreshButtons();
+    };
+    box.appendChild(el);
+  }
+  budgetHint();
+}
+
+/** 提醒这个改动要重启服务才生效 —— 它是启动参数。 */
+function budgetHint() {
+  const note = $('budgetNote');
+  if (!note) return;
+  const b = (CATALOGUE.budgets || []).find((x) => x.key === selBudget);
+  note.textContent = b && b.value < 0 ? '(不限,不干预)' : '';
+}
+
+function saveBudget() {
+  try { localStorage.setItem(BUDGET_STORE_KEY, selBudget); } catch (e) { /* 忽略 */ }
+}
+function loadBudget() {
+  try {
+    const v = localStorage.getItem(BUDGET_STORE_KEY);
+    if (v && (CATALOGUE.budgets || []).some((b) => b.key === v)) return v;
+  } catch (e) { /* 忽略 */ }
+  return CATALOGUE.defaultBudget || null;
 }
 
 function refreshButtons() {
@@ -553,7 +609,7 @@ async function doStart() {
   const reasoning = loadShowReasoning() ? selReasoning : null;
   // 局域网开关从设置里读,和 API Key 一起生效。
   const lanMode = !!SETTINGS.lanMode;
-  const r = await window.shell.start(selModel, selPreset, reasoning, lanMode);
+  const r = await window.shell.start(selModel, selPreset, reasoning, lanMode, selBudget);
   busy = false; refreshButtons();
   if (!r.ok) {
     setDot('err', '启动失败');
@@ -689,7 +745,8 @@ async function showLogs() {
   const first = CATALOGUE.models.find((m) => m.present);
   if (first) { selModel = first.id; selPreset = first.defaultPreset; }
   selReasoning = loadReasoning();
-  renderModels(); renderPresets(); renderReasoning(); refreshButtons();
+  selBudget = loadBudget();
+  renderModels(); renderPresets(); renderReasoning(); renderBudgets(); refreshButtons();
   applyReasoningVisibility();
   await loadSettingsToUi();
   await refresh();

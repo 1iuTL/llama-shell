@@ -15,7 +15,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 
-const { MODELS, PRESETS, REASONING, buildArgs } = require('./config');
+const { MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET, buildArgs } = require('./config');
 const settings = require('./settings');
 
 const PORT = 8091;
@@ -24,7 +24,7 @@ const BASE = `http://127.0.0.1:${PORT}`;
 let win = null;
 let child = null;
 // 未运行时的状态。收成一个常量,免得三处各写一份、改漏一处。
-const EMPTY_CURRENT = { modelId: null, preset: null, reasoning: null, lanMode: false, startedAt: null };
+const EMPTY_CURRENT = { modelId: null, preset: null, reasoning: null, budget: null, lanMode: false, startedAt: null };
 let current = { ...EMPTY_CURRENT };
 let logFile = null;
 
@@ -204,7 +204,7 @@ function killLeftoverServers() {
  *  reasoningKey 为 null/空时**不传** --reasoning-effort,由模型模板或界面自行决定。
  *  lanMode 为 true 时监听 0.0.0.0,手机等其它设备才能连上。
  *  apiKey 从本地设置里读,非空则加 --api-key 给所有接口上锁。 */
-async function startServer(modelId, presetKey, reasoningKey, lanMode) {
+async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey) {
   await stopServer();
 
   const model = MODELS.find((m) => m.id === modelId);
@@ -216,7 +216,7 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode) {
   killLeftoverServers();
 
   const apiKey = (settings.readSettings().apiKey || '').trim();
-  const args = buildArgs(model, presetKey, PORT, reasoningKey, lanMode, apiKey);
+  const args = buildArgs(model, presetKey, PORT, reasoningKey, lanMode, apiKey, budgetKey);
 
   fs.mkdirSync(LOG_DIR, { recursive: true });
   logFile = path.join(LOG_DIR, `shell-${modelId}.log`);
@@ -234,7 +234,7 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode) {
     detached: true,
     stdio: ['ignore', out, out],
   });
-  current = { modelId, preset: presetKey, reasoning: reasoningKey || null, lanMode: !!lanMode, startedAt: Date.now() };
+  current = { modelId, preset: presetKey, reasoning: reasoningKey || null, budget: budgetKey || null, lanMode: !!lanMode, startedAt: Date.now() };
 
   // 记进台账:万一外壳非正常退出,下次启动能靠它把这个进程收掉。
   if (child.pid) writeLedger([child.pid]);
@@ -261,7 +261,7 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode) {
     throw new Error(`服务启动失败或超时。日志末尾:\n${tail}`);
   }
   try { fs.appendFileSync(logFile, '[shell] 服务就绪\n'); } catch {}
-  return { url: `${BASE}/`, modelId, preset: presetKey, reasoning: current.reasoning, lanMode: current.lanMode };
+  return { url: `${BASE}/`, modelId, preset: presetKey, reasoning: current.reasoning, budget: current.budget, lanMode: current.lanMode };
 }
 
 // ------------------------------------------------------------------ 渲染层
@@ -309,6 +309,10 @@ ipcMain.handle('catalogue', () => ({
   reasoning: Object.entries(REASONING).map(([k, v]) => ({
     key: k, label: v.label, hint: v.hint, flag: v.flag,
   })),
+  budgets: REASONING_BUDGETS.map((b) => ({
+    key: b.key, label: b.label, hint: b.hint, value: b.value,
+  })),
+  defaultBudget: DEFAULT_REASONING_BUDGET,
   port: PORT,
 }));
 
@@ -347,9 +351,9 @@ ipcMain.handle('settings:genkey', () => {
 /** 网卡可能中途插拔(开热点就会多一个),所以地址要能刷新。 */
 ipcMain.handle('net:addresses', () => localAddresses(PORT));
 
-ipcMain.handle('start', async (_e, { modelId, preset, reasoning, lanMode }) => {
+ipcMain.handle('start', async (_e, { modelId, preset, reasoning, lanMode, budget }) => {
   try {
-    const r = await startServer(modelId, preset, reasoning, lanMode);
+    const r = await startServer(modelId, preset, reasoning, lanMode, budget);
     return { ok: true, ...r };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -372,6 +376,7 @@ ipcMain.handle('status', async () => {
     modelName: model ? model.name : null,
     preset: current.preset,
     reasoning: current.reasoning,
+    budget: current.budget,
     lanMode: current.lanMode,
     ctx,
     uptimeSec: current.startedAt ? Math.floor((Date.now() - current.startedAt) / 1000) : 0,
@@ -391,34 +396,44 @@ app.whenReady().then(async () => {
   settings.initSettings(settingsDir);
   createWindow();
 
-  // 自测开关:MODEL_STOVE_AUTOSTART="<模型id>:<预设>[:<思考强度>]" 会在启动时
-  // 立刻拉起一个服务,用来在不点任何按钮的情况下验证 拉起→健康检查→界面 这条链路。
-  // 不设这个变量时完全无副作用。
+  // 自测开关:MODEL_STOVE_AUTOSTART="<模型id>:<预设>[:<思考强度>[:<思考预算>|lan]]"
+  // 会在启动时立刻拉起一个服务,用来在不点任何按钮的情况下验证
+  // 拉起→健康检查→界面 这条链路。不设这个变量时完全无副作用。
   const auto = process.env.MODEL_STOVE_AUTOSTART;
   if (auto) {
-    const [modelId, preset, reasoning, lan] = auto.split(':');
-    // 等窗口加载完,免得在渲染层还不存在时就发状态变更。
-    try {
-      await new Promise((r) => {
-        if (!win || win.webContents.isLoadingMainFrame()) {
-          win.webContents.once('did-finish-load', r);
-        } else r();
-      });
-    } catch {}
-    console.log('[shell] 自测启动', modelId, preset, reasoning || '(默认思考强度)');
-    try {
-      await startServer(modelId, preset, reasoning, lan === 'lan');
-      console.log('[shell] 自测启动成功');
-      notifyRenderer();
-    } catch (e) {
-      console.error('[shell] 自测启动失败:', e.message);
-      if (win && !win.isDestroyed()) {
-        win.webContents.executeJavaScript(
-          `alert(${JSON.stringify('自测启动失败:\n\n' + e.message)})`).catch(() => {});
-      }
-    }
+    const [modelId, preset, reasoning, fourth] = auto.split(':');
+    await autoStart(modelId, preset, reasoning, fourth);
   }
 });
+
+/**
+ * 自测启动。第四段兼容两种含义:老写法 'lan' 表示局域网,
+ * 新写法可以是思考预算的键名(此时局域网关)。
+ */
+async function autoStart(modelId, preset, reasoning, fourth) {
+  // 等窗口加载完,免得在渲染层还不存在时就发状态变更。
+  try {
+    await new Promise((r) => {
+      if (!win || win.webContents.isLoadingMainFrame()) {
+        win.webContents.once('did-finish-load', r);
+      } else r();
+    });
+  } catch {}
+  const lanMode = fourth === 'lan';
+  const budgetKey = lanMode ? null : (fourth || null);
+  console.log('[shell] 自测启动', modelId, preset, reasoning || '(默认思考强度)', budgetKey || '(默认预算)');
+  try {
+    await startServer(modelId, preset, reasoning, lanMode, budgetKey);
+    console.log('[shell] 自测启动成功');
+    notifyRenderer();
+  } catch (e) {
+    console.error('[shell] 自测启动失败:', e.message);
+    if (win && !win.isDestroyed()) {
+      win.webContents.executeJavaScript(
+        `alert(${JSON.stringify('自测启动失败:\n\n' + e.message)})`).catch(() => {});
+    }
+  }
+}
 
 app.on('window-all-closed', async () => {
   await stopServer();
