@@ -489,7 +489,36 @@ function showFrame(url) {
   if (loadedUrl === url) return;          // 已经在显示了,什么都不做
   loadedUrl = url;
   frameFailed = false;
+  // 导航前先把 Key 注入 webview 的存储,免得界面一起就撞 401。
+  frameKeyDone = false;
+  injectApiKeyIntoFrame();
   f.setAttribute('src', url);
+}
+
+/**
+ * 把外壳里存的 API Key 写进 webview 的 localStorage,让桌面端不必手输。
+ *
+ * 为什么需要:--api-key 是**服务级**的,它一视同仁地挡住所有人,包括本机
+ * 这个界面。聊天界面把 Key 存在自己的 localStorage 里,但那个存储属于
+ * webview 的会话分区,外壳重启后可能拿不到,于是每次都弹一次输入框。
+ *
+ * 而桌面这台机器的主人本来就能直接读 settings.json —— 让他再手输一遍
+ * 没有任何安全收益,只有麻烦。Key 依然只对**局域网**有意义(手机必须输)。
+ *
+ * 存储键名 "LlamaUi.config" 是**从实际 bundle 里读出来的**:前端用
+ * localStorage.setItem(`${ou}.config`, ...) 保存配置,而 ou = "LlamaUi"。
+ * 这类键名不是公开接口,上游随时可能改,所以整段包在 try/catch 里 ——
+ * 最坏结果只是退回"手动输一次",不会把界面搞坏。
+ */
+function injectApiKeyIntoFrame() {
+  const key = (SETTINGS.apiKey || '').trim();
+  if (!key) return;
+  const f = $('frame');
+  const code = `(function(){try{var k='LlamaUi.config';var cur={};try{cur=JSON.parse(localStorage.getItem(k)||'{}')||{}}catch(e){}cur.apiKey=${JSON.stringify(key)};localStorage.setItem(k,JSON.stringify(cur))}catch(e){}})()`;
+  const run = () => { try { f.executeJavaScript(code).catch(() => {}); } catch (e) { /* 忽略 */ } };
+  run();
+  // 再等一次:executeJavaScript 在页面还在导航时可能落到旧文档上。
+  setTimeout(run, 1200);
 }
 
 function hideFrame() {

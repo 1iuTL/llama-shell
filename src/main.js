@@ -23,7 +23,9 @@ const BASE = `http://127.0.0.1:${PORT}`;
 
 let win = null;
 let child = null;
-let current = { modelId: null, preset: null, reasoning: null, lanMode: false, startedAt: null };
+// 未运行时的状态。收成一个常量,免得三处各写一份、改漏一处。
+const EMPTY_CURRENT = { modelId: null, preset: null, reasoning: null, lanMode: false, startedAt: null };
+let current = { ...EMPTY_CURRENT };
 let logFile = null;
 
 // 子进程的输出写进文件,而不是管道。
@@ -132,16 +134,70 @@ function localAddresses(port) {
 /** 停掉当前服务。先温和 kill,8 秒不退就强杀。 */
 function stopServer() {
   return new Promise((resolve) => {
-    if (!child) { current = { modelId: null, preset: null, reasoning: null, lanMode: false, startedAt: null }; return resolve(); }
+    if (!child) { current = {...EMPTY_CURRENT}; return resolve(); }
     const dying = child;
     child = null;
+    // 这个进程即将退出,先把它从台账里摘掉,免得下次启动去杀一个已死的 PID。
+    writeLedger([]);
     try {
       dying.kill();
     } catch { /* 已经没了 */ }
-    const done = () => { current = { modelId: null, preset: null, reasoning: null, lanMode: false, startedAt: null }; resolve(); };
+    const done = () => { current = {...EMPTY_CURRENT}; resolve(); };
     const t = setTimeout(() => { try { dying.kill('SIGKILL'); } catch {} ; done(); }, 8000);
     dying.once('exit', () => { clearTimeout(t); done(); });
   });
+}
+
+/**
+ * 外壳自己 spawn 过的服务进程的 PID 台账。
+ *
+ * 为什么需要:子进程用 detached 启动(外壳崩了它也能活,这是有意的),
+ * 但外壳重启后 `child` 变量是 null,stopServer() 就成了空操作 ——
+ * 旧进程永远留着。实测后果很严重:两个 llama-server 同时抢 8 GB 显存,
+ * 第二个被挤到系统内存,生成速度从 43 t/s 掉到 3.5 t/s;而且旧的那个会
+ * 变成"进程活着但不监听端口"的僵尸,手机连上去只会一直转圈。
+ *
+ * 为什么用台账而不是查进程表:查进程表要么依赖 WMI(受限环境里查不到),
+ * 要么按进程名匹配 —— 那就可能连**用户自己在别的端口上手动跑的服务**一起
+ * 杀掉。台账只记录我们自己启动过的 PID,精确且不会误伤。
+ * PID 会被系统复用,但配合"启动时清理"这个时机,风险可以忽略。
+ */
+function ledgerPath() {
+  return path.join(LOG_DIR, 'running-pids.json');
+}
+
+function readLedger() {
+  try {
+    const v = JSON.parse(fs.readFileSync(ledgerPath(), 'utf8'));
+    return Array.isArray(v) ? v.filter((n) => Number.isInteger(n) && n > 0) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeLedger(pids) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.writeFileSync(ledgerPath(), JSON.stringify(pids), 'utf8');
+  } catch { /* 台账写不了也不该阻断服务 */ }
+}
+
+/**
+ * 清掉外壳上次遗留的服务进程。
+ * 只看台账里记过的 PID,因此绝不会碰到用户手动启动的 llama-server。
+ */
+function killLeftoverServers() {
+  const pids = readLedger();
+  const killed = [];
+  for (const pid of pids) {
+    try {
+      process.kill(pid);
+      killed.push(pid);
+    } catch { /* 已经不在了,正常 */ }
+  }
+  writeLedger([]);
+  if (killed.length) console.log(`[shell] 清掉了 ${killed.length} 个上次遗留的服务进程: ${killed.join(', ')}`);
+  return killed;
 }
 
 /** 拉起服务并等它就绪。
@@ -155,6 +211,9 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode) {
   if (!model) throw new Error(`未知的模型标识: ${modelId}`);
   if (!modelExists(model)) throw new Error(`模型文件不存在:\n${model.file}`);
   if (!binExists(model)) throw new Error(`llama-server 不存在:\n${model.bin}`);
+
+  // 外壳重启后 stopServer() 是空操作,先按台账清掉上次遗留的进程再占显存。
+  killLeftoverServers();
 
   const apiKey = (settings.readSettings().apiKey || '').trim();
   const args = buildArgs(model, presetKey, PORT, reasoningKey, lanMode, apiKey);
@@ -177,6 +236,9 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode) {
   });
   current = { modelId, preset: presetKey, reasoning: reasoningKey || null, lanMode: !!lanMode, startedAt: Date.now() };
 
+  // 记进台账:万一外壳非正常退出,下次启动能靠它把这个进程收掉。
+  if (child.pid) writeLedger([child.pid]);
+
   // 子进程已经有自己的句柄了;我们继续持有会每次启动漏一个 fd。
   try { fs.closeSync(out); } catch {}
   try { child.unref(); } catch {}
@@ -187,7 +249,8 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode) {
 
   child.on('exit', (code) => {
     try { fs.appendFileSync(logFile, `[shell] 服务退出,code=${code}\n`); } catch {}
-    if (child) { child = null; current = { modelId: null, preset: null, reasoning: null, lanMode: false, startedAt: null }; }
+    writeLedger([]);
+    if (child) { child = null; current = { ...EMPTY_CURRENT }; }
     notifyRenderer();
   });
 

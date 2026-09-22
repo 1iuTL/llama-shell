@@ -22,6 +22,22 @@ const BIN = {
   stock: path.join(WORKSPACE, 'llama-cpp', 'llama-server.exe'),
 };
 
+// 思考强度的 token 上限。
+//
+// 为什么必须有这个上限:llama-server 的 --reasoning-budget 默认是 **-1(无限)**,
+// 而部分模型的聊天模板默认又是最高档思考。两者一叠加,简单问题也可能让模型
+// 无限"想"下去 —— 界面上表现为 reasoning 区一直刷同一个字符,永远不产出答案。
+//
+// 4096 的依据:实测那次失控在 186 token / 52 秒时还在跑(186 token 本身不多,
+// 问题是它不肯停),正常问答的思考通常远小于这个数。给够空间,但到点必须收。
+// 想完全不限制可以设成 -1,但一般不建议 —— 除非你在专门测模型的思考上限。
+const REASONING_BUDGET = 4096;
+
+// 预算耗尽时注入的收尾提示。不设的话模型可能被硬截断在思考中途,
+// 拿到半截思考而没有答案;给了这句它会转向作答。
+const REASONING_BUDGET_MESSAGE =
+  '思考预算已用完,请立即基于已有分析给出最终答案。';
+
 const MMPROJ = 'D:\\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf';
 
 // 视觉能力会多占约 0.9 GiB(投影器放内存)外加图片 token,
@@ -132,6 +148,10 @@ const MODELS = [
  *
  * apiKey 非空时加 --api-key,所有接口都要带 Authorization: Bearer <key>。
  *
+ * 另外无条件加 --reasoning-budget(除非思考档位是 off)。llama-server 那个
+ * 参数默认 -1 = 无限,配合"模板默认最高档思考"的模型会让简单问题也停不下来,
+ * 界面上就是 reasoning 一直刷、永远不出答案。详见 REASONING_BUDGET 的注释。
+ *
  * 关于 API Key 与网页界面:llama.cpp 自带的 Web UI **认识**这个 Key ——
  * 检测到 401 会弹一个输入框,校验通过就存进浏览器 localStorage,之后免输。
  * 所以手机只需输一次。注意 / 这个页面本身是放行的(不然连输入框都拿不到),
@@ -168,6 +188,13 @@ function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey) {
   // 绑到网络上时关掉。
   if (lanMode) args.push('--no-slots');
 
+  // 思考预算:不加上限的话,模型可能一直"想"下去不产出答案。
+  // 关掉思考档位(reasoningKey === 'off')时不加,那种情况下本就不会思考。
+  if (reasoningKey !== 'off') {
+    args.push('--reasoning-budget', String(REASONING_BUDGET));
+    args.push('--reasoning-budget-message', REASONING_BUDGET_MESSAGE);
+  }
+
   // 只在真的设了 Key 时才加。留空表示不鉴权 —— 局域网模式下等于
   // 同网段任何人都能用,界面上必须把这件事说清楚。
   if (apiKey) args.push('--api-key', apiKey);
@@ -178,4 +205,7 @@ function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey) {
   return args;
 }
 
-module.exports = { MODELS, PRESETS, REASONING, BIN, MMPROJ, MODELS_DIR, buildArgs };
+module.exports = {
+  MODELS, PRESETS, REASONING, BIN, MMPROJ, MODELS_DIR, buildArgs,
+  REASONING_BUDGET,
+};
