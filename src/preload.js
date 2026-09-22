@@ -1,4 +1,4 @@
-// llama-shell —— 渲染层与主进程之间的桥。
+// model-stove —— 渲染层与主进程之间的桥。
 // contextIsolation 已开启,所以渲染层只能看到这里显式暴露的方法。
 const { contextBridge, ipcRenderer } = require('electron');
 

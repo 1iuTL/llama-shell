@@ -1,4 +1,4 @@
-// llama-shell —— 一个围绕 llama-server 的极简 Electron 外壳。
+// model-stove —— 一个围绕 llama-server 的极简 Electron 外壳。
 //
 // 职责:
 //   1. 选一个模型 + 预设(以及思考强度)
@@ -160,7 +160,7 @@ function createWindow() {
     minWidth: 940,
     minHeight: 620,
     backgroundColor: '#14161a',
-    title: 'llama-shell · 本地模型外壳',
+    title: 'Model Stove · 模型灶台',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -233,10 +233,10 @@ ipcMain.handle('logs', () => readLogTail(250));
 app.whenReady().then(async () => {
   createWindow();
 
-  // 自测开关:LLAMA_SHELL_AUTOSTART="<模型id>:<预设>[:<思考强度>]" 会在启动时
+  // 自测开关:MODEL_STOVE_AUTOSTART="<模型id>:<预设>[:<思考强度>]" 会在启动时
   // 立刻拉起一个服务,用来在不点任何按钮的情况下验证 拉起→健康检查→界面 这条链路。
   // 不设这个变量时完全无副作用。
-  const auto = process.env.LLAMA_SHELL_AUTOSTART;
+  const auto = process.env.MODEL_STOVE_AUTOSTART;
   if (auto) {
     const [modelId, preset, reasoning] = auto.split(':');
     // 等窗口加载完,免得在渲染层还不存在时就发状态变更。

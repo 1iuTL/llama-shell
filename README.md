@@ -1,12 +1,14 @@
-# llama-shell
+# Model Stove(模型灶台)
 
-一个极简的 Electron 外壳,用来管理本地 `llama-server`,并把 llama.cpp 自带的 Web 聊天界面装进一个桌面窗口。
+**本地模型启动器** —— 把 [llama.cpp](https://github.com/ggml-org/llama.cpp) 的 `llama-server` 管起来,并把它自带的 Web 聊天界面装进一个桌面窗口。
 
-聊天界面本身是 llama.cpp 官方提供的 —— 这个外壳只负责**进程编排**:列模型、选预设、拉起服务、等它就绪、把界面指过去、退出时收干净。
+一个极简的 Electron 外壳:列模型、选预设、拉起服务、等它就绪、把界面指过去、退出时收干净。
+
+聊天界面本身是 llama.cpp 官方提供的,**这个外壳只负责进程编排**,不绑定任何模型。
 
 ```
 ┌──────────────────────────────────────────────┐
-│  llama-shell  (Electron)                     │
+│  model-stove  (Electron)                     │
 │  ┌────────────────────┬────────────────────┐ │
 │  │ 侧栏                │ <webview>          │ │
 │  │  模型列表            │  llama.cpp 官方    │ │

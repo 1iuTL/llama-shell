@@ -1,4 +1,4 @@
-﻿const base = "https://api.github.com/repos/1iuTL/llama-shell";
+﻿const base = "https://api.github.com/repos/1iuTL/model-stove";
 const r = await fetch(base, { headers: { "User-Agent": "dsh" } });
 if (!r.ok) { console.log("HTTP", r.status); process.exit(1); }
 const j = await r.json();

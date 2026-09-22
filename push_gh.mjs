@@ -1,4 +1,4 @@
-// Push the llama-shell working tree to GitHub through the REST API.
+// Push the model-stove working tree to GitHub through the REST API.
 //
 // Why the API and not `git push`: git's TLS backends are unusable inside this
 // sandbox (schannel cannot acquire credentials; Git for Windows' sh.exe cannot
@@ -11,8 +11,8 @@ import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 
-const SRC = 'C:\\deepseek harness\\llama-shell';
-const target = process.argv[2] || '1iuTL/llama-shell';
+const SRC = 'C:\\deepseek harness\\model-stove';
+const target = process.argv[2] || '1iuTL/model-stove';
 const [owner, repo] = target.split('/');
 
 // Files that belong in the repo, in order. node_modules/ and logs/ are excluded.
@@ -67,7 +67,7 @@ async function gh(token, method, p, body) {
     headers: {
       Authorization: 'Bearer ' + token,
       Accept: 'application/vnd.github+json',
-      'User-Agent': 'llama-shell-push',
+      'User-Agent': 'model-stove-push',
       'X-GitHub-Api-Version': '2022-11-28',
       'Content-Type': 'application/json',
     },

@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>llama-shell · 本地模型外壳</title>
+<title>Model Stove · 模型灶台 — 本地模型启动器</title>
 <style>
   :root {
     --bg: #14161a;
@@ -135,8 +135,8 @@
 
 <aside id="side">
   <h1>
-    <div class="titles">llama-shell
-      <small>llama-server 管理外壳 · 界面由 llama.cpp 提供</small>
+    <div class="titles">Model Stove 模型灶台
+      <small>本地模型启动器 · llama-server 图形外壳</small>
     </div>
     <button id="btnSettings" title="外壳设置">⚙</button>
   </h1>
@@ -222,8 +222,8 @@ let busy = false;
 let loadedUrl = null;
 let frameFailed = false;
 
-const REASONING_STORE_KEY = 'llama-shell.reasoning';
-const SHOW_REASONING_KEY = 'llama-shell.showReasoning';
+const REASONING_STORE_KEY = 'model-stove.reasoning';
+const SHOW_REASONING_KEY = 'model-stove.showReasoning';
 
 // 侧栏的「思考强度」默认隐藏。
 //
