@@ -214,12 +214,15 @@ src/qr.js         零依赖二维码生成器(给手机访问面板用)
 
 `src/qr.js` 是自己写的,不是引包 —— 外壳要求完全离线,而这里只需要编一条几十字节的局域网地址。它只实现 byte 模式 + 纠错等级 L + 版本 1–10。生成结果与参考实现(经典 `qrcode.js`)逐格对拍一致,并有往返解码测试。
 
-`tools/` 下是两个二维码验证脚本(`test_qr.cjs` 结构测试、`decode_qr.cjs` 往返解码)和一个推送脚本。跑测试不需要任何依赖:
+`tools/` 下是验证脚本和一个推送脚本,跑测试不需要任何依赖:
 
 ```
-node tools/test_qr.cjs
-node tools/decode_qr.cjs
+node tools/test_qr.cjs       # 二维码结构(24 项)
+node tools/decode_qr.cjs     # 二维码往返解码(版本 1-10、多块交织、中文)
+node tools/check_ui.cjs      # 界面结构:内联脚本语法、元素引用、id 唯一性
 ```
+
+`check_ui.cjs` 值得单独说一句:它会把 `index.html` 里 `$('xxx')` 引用到的每个 id 都对着 HTML 核一遍,并检查 id 不重复。这类错误不会在启动时报出来,只会在点某个按钮时静默失效,所以值得机器检查。
 
 ## 已知限制
 

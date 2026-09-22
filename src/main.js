@@ -82,11 +82,29 @@ function binExists(model) {
 }
 
 /**
+ * 判断一个地址是不是"手机热点"的网卡。
+ *
+ * Windows 自带移动热点固定用 192.168.137.0/24 这一段,网卡名通常形如
+ * "本地连接* N"。命中它就几乎可以确定:手机连上热点后正是走这个地址。
+ */
+function looksLikeHotspot(name, address) {
+  if (/^192\.168\.137\./.test(address)) return true;
+  // 中文系统的热点虚拟网卡名;也认一下英文的
+  return /本地连接\s*\*|Local Area Connection\s*\*|Microsoft Wi-Fi Direct/i.test(name);
+}
+
+/**
  * 列出本机可用的 IPv4 地址,给「手机怎么连」那块界面用。
  *
  * 会同时给出好几个,因为这台机器经常同时挂着 WiFi、有线、以及热点虚拟网卡,
  * 而**哪个能通取决于手机连的是哪个网络** —— 光看名字猜不出来,所以全列出来
  * 让用户自己试。跳过回环地址(手机连不上 127.0.0.1)和已断开的网卡。
+ *
+ * 但**顺序很重要**:界面上第一个地址会被编进二维码,而手机大概率是连热点。
+ * 所以热点网卡必须排在前面,否则二维码会指到校园网那个地址上 —— 手机
+ * 在热点上根本连不到,表现就是一直转圈。
+ *
+ * 返回项里的 recommended 供界面打标,别让用户自己猜该扫哪个。
  */
 function localAddresses(port) {
   const out = [];
@@ -96,9 +114,16 @@ function localAddresses(port) {
       // Node 18+ 的 family 是数字 4,老版本是字符串 'IPv4'。两种都认。
       const isV4 = a.family === 4 || a.family === 'IPv4';
       if (!isV4 || a.internal) continue;
-      out.push({ name, address: a.address, url: `http://${a.address}:${port}/` });
+      out.push({
+        name,
+        address: a.address,
+        url: `http://${a.address}:${port}/`,
+        recommended: looksLikeHotspot(name, a.address),
+      });
     }
   }
+  // recommended 排前面。同组内保持系统给的顺序,行为可预期。
+  out.sort((x, y) => (y.recommended ? 1 : 0) - (x.recommended ? 1 : 0));
   return out;
 }
 

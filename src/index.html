@@ -42,7 +42,13 @@
   }
   #btnSettings.on { border-color: var(--accent); background: #1e2734; }
 
-  #settings { border-bottom: 1px solid var(--line); background: #171a1f; max-height: 62vh; overflow-y: auto; }
+  #settings {
+    border-bottom: 1px solid var(--line); background: #171a1f;
+    /* 设置面板内容较多,给它一个上限并自己滚动。
+       否则打开设置时,底部的「启动」按钮会被挤出可视区域 ——
+       用户得先滚动才能找到它,很容易误以为软件没反应。 */
+    max-height: 58vh; overflow-y: auto; flex: 0 0 auto;
+  }
   #settings.hidden { display: none; }
   #settings .inner { padding: 12px 14px; }
   #settings .opt {
@@ -88,8 +94,24 @@
     word-break: break-all; color: #c9d1d9;
   }
   .lanurl .n { color: var(--dim); font-size: 10.5px; flex: 0 0 auto; }
+  .lanurl.rec { border-color: #3a5a3a; background: #121a14; }
+  .lanurl.rec .n { color: var(--ok); font-weight: 500; }
   .lanurl button {
     width: auto; flex: 0 0 auto; padding: 3px 8px; font-size: 11px; font-weight: 400;
+  }
+  #settings .warn {
+    background: #2a1f10; border: 1px solid #5a4a1a; color: #e8c46a;
+    border-radius: 6px; padding: 7px 9px; font-size: 11px; line-height: 1.5;
+    margin-bottom: 7px;
+  }
+  /* 服务没跑时让「启动」按钮自己跳出来,别让人找不到 */
+  button.attention {
+    box-shadow: 0 0 0 2px rgba(76, 141, 255, .35);
+    animation: pulse 1.8s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 0 2px rgba(76, 141, 255, .35); }
+    50% { box-shadow: 0 0 0 5px rgba(76, 141, 255, .12); }
   }
   #qrbox {
     margin-top: 8px; background: #fff; border-radius: 8px; padding: 8px;
@@ -196,15 +218,6 @@
 
   <div id="settings" class="hidden">
     <div class="inner">
-      <label class="opt">
-        <input type="checkbox" id="optReasoning" />
-        <span class="txt">
-          <b>显示思考强度选择器</b>
-          <span>开启后侧栏多一栏,可固定「服务级」思考档位。关闭时外壳不传
-            <code>--reasoning-effort</code>,完全交给聊天界面里那个按对话设置的档位。</span>
-        </span>
-      </label>
-
       <div class="sec">
         <div class="h">API KEY
           <span class="spacer"></span>
@@ -238,10 +251,22 @@
         <div id="qrbox" class="hidden"></div>
         <div id="qrwhy" class="hidden">手机扫码打开</div>
         <ol class="steps">
-          <li>让手机和电脑处在<code>同一个热点</code>下(校园网常隔离设备,热点最稳)</li>
-          <li>手机连上后,扫上面的码或手输地址</li>
+          <li>在电脑上开<code>移动热点</code>,让手机连上它(校园网常隔离设备,热点最稳)</li>
+          <li>点左侧「启动」并等模型加载完 —— 没启动的话手机只会一直转圈</li>
+          <li>手机扫上面的码或手输地址</li>
           <li>首次打开会要 API Key,填一次即可</li>
         </ol>
+      </div>
+
+      <div class="sec">
+        <label class="opt" style="padding:4px 0">
+          <input type="checkbox" id="optReasoning" />
+          <span class="txt">
+            <b>显示思考强度选择器</b>
+            <span>开启后侧栏多一栏,可固定「服务级」思考档位。关闭时外壳不传
+              <code>--reasoning-effort</code>,完全交给聊天界面里那个按对话设置的档位。</span>
+          </span>
+        </label>
       </div>
     </div>
   </div>
@@ -314,6 +339,8 @@ let selReasoning = 'medium';
 let busy = false;
 let loadedUrl = null;
 let frameFailed = false;
+// 服务是否在跑。局域网面板要用它决定是否提示"先点启动"。
+let SERVICE_RUNNING = false;
 
 const REASONING_STORE_KEY = 'model-stove.reasoning';
 const SHOW_REASONING_KEY = 'model-stove.showReasoning';
@@ -426,6 +453,13 @@ function setDot(cls, text) {
 
 async function refresh() {
   const s = await window.shell.status();
+  const wasRunning = SERVICE_RUNNING;
+  SERVICE_RUNNING = !!s.running;
+  // 状态变化时重画局域网面板 —— 那句"服务未运行"的提示要能自己消失。
+  if (wasRunning !== SERVICE_RUNNING) {
+    renderLan();
+    $('btnStart').classList.toggle('attention', !SERVICE_RUNNING && !busy);
+  }
   if (s.running) {
     setDot('on', '运行中');
     $('stCtx').textContent = s.ctx ? s.ctx.toLocaleString() + ' tokens' : '—';
@@ -515,8 +549,9 @@ let SETTINGS = { apiKey: '', lanMode: false, addresses: [] };
  * 重画局域网地址列表。
  *
  * 会列出所有非回环 IPv4,因为这台机器通常同时挂着 WiFi 和热点虚拟网卡,
- * 而哪个能通取决于手机连的是哪个网络 —— 猜不出来,所以全列出来。
- * 默认把第一个放进二维码:多数情况下那是对的那个(热点优先)。
+ * 而哪个能通取决于手机连的是哪个网络。但**列表顺序由主进程排好了**:
+ * 热点网卡在前,因为它就是手机连上后实际走的那个地址。
+ * 第一个地址会被编进二维码,所以顺序错了二维码就会指错地方。
  */
 function renderLan() {
   const box = $('lanList');
@@ -536,13 +571,24 @@ function renderLan() {
     return;
   }
 
+  // 服务没在跑的时候,把这件事说在最前面 —— 否则用户扫码后只会看到
+  // 手机浏览器一直转圈,根本猜不到是后面没有服务。
+  if (!SERVICE_RUNNING) {
+    const warn = document.createElement('div');
+    warn.className = 'warn';
+    warn.textContent = '服务当前未运行。地址和二维码已经就绪,但必须先点左侧「启动」,手机才连得上。';
+    box.appendChild(warn);
+  }
+
   list.forEach((a, i) => {
     const row = document.createElement('div');
     row.className = 'lanurl';
     row.innerHTML = `<span class="u"></span><span class="n"></span>`;
     // 用 textContent 而不是 innerHTML:网卡名和地址都是外部数据
     row.querySelector('.u').textContent = a.url;
-    row.querySelector('.n').textContent = a.name;
+    // 热点那条标出来,告诉用户该扫哪个
+    row.querySelector('.n').textContent = a.recommended ? '热点 · 手机连这个' : a.name;
+    if (a.recommended) row.classList.add('rec');
     const copy = document.createElement('button');
     copy.textContent = '复制';
     copy.onclick = () => {
