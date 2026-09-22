@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>llama-shell</title>
+<style>
+  :root {
+    --bg: #14161a;
+    --panel: #1b1e24;
+    --panel-2: #22262e;
+    --line: #2d323c;
+    --text: #e6e8ec;
+    --dim: #8b93a1;
+    --accent: #4c8dff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --err: #f85149;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    display: flex; background: var(--bg); color: var(--text);
+    font: 13px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    overflow: hidden;
+  }
+
+  /* ---------------------------------------------------------------- sidebar */
+  #side {
+    width: 320px; flex: 0 0 320px; display: flex; flex-direction: column;
+    background: var(--panel); border-right: 1px solid var(--line);
+  }
+  #side h1 {
+    font-size: 14px; margin: 0; padding: 14px 16px 12px;
+    border-bottom: 1px solid var(--line); font-weight: 600; letter-spacing: .3px;
+  }
+  #side h1 small { display: block; color: var(--dim); font-weight: 400; font-size: 11px; margin-top: 3px; }
+  .scroll { overflow-y: auto; flex: 1; }
+  .group { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .group > .label {
+    color: var(--dim); font-size: 11px; text-transform: uppercase;
+    letter-spacing: .6px; margin-bottom: 8px;
+  }
+
+  .item {
+    display: block; width: 100%; text-align: left; cursor: pointer;
+    background: var(--panel-2); border: 1px solid transparent; border-radius: 7px;
+    color: var(--text); padding: 9px 11px; margin-bottom: 6px; font: inherit;
+  }
+  .item:hover { border-color: #3a4150; }
+  .item.sel { border-color: var(--accent); background: #1e2734; }
+  .item .t { font-weight: 500; }
+  .item .d { color: var(--dim); font-size: 11px; margin-top: 2px; }
+  .item.missing { opacity: .45; cursor: not-allowed; }
+  .item.missing .d { color: var(--warn); }
+
+  #controls { padding: 12px 14px; border-top: 1px solid var(--line); }
+  button {
+    width: 100%; padding: 10px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text); font: inherit; cursor: pointer;
+    font-weight: 500;
+  }
+  button:hover:not(:disabled) { border-color: #3a4150; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { background: #3d7ce8; }
+  button.danger { background: #3a2020; border-color: #5a2b2b; color: #ffb4b4; }
+
+  /* ---------------------------------------------------------------- status */
+  #status { padding: 10px 14px; border-top: 1px solid var(--line); font-size: 12px; }
+  .row { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
+  .row .k { color: var(--dim); }
+  .row .v { text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dim); margin-right: 6px; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+  .dot.busy { background: var(--warn); }
+  .dot.err { background: var(--err); }
+
+  /* ------------------------------------------------------------------ main */
+  #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #bar {
+    height: 38px; flex: 0 0 38px; display: flex; align-items: center; gap: 10px;
+    padding: 0 12px; border-bottom: 1px solid var(--line); background: var(--panel);
+    font-size: 12px; color: var(--dim);
+  }
+  #bar .spacer { flex: 1; }
+  #bar button { width: auto; padding: 5px 11px; font-size: 12px; font-weight: 400; }
+  #stage { flex: 1; position: relative; background: #0f1114; }
+  #frame { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  #frame.hidden { display: none; }
+
+  #placeholder {
+    position: absolute; inset: 0; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 12px; color: var(--dim);
+    text-align: center; padding: 40px;
+  }
+  #placeholder.hidden { display: none; }
+  #placeholder .big { font-size: 34px; opacity: .35; }
+  #placeholder code {
+    background: var(--panel-2); padding: 2px 6px; border-radius: 4px;
+    color: #c9d1d9; font-size: 12px;
+  }
+
+  /* ------------------------------------------------------------------ log */
+  #logwrap { flex: 0 0 auto; border-top: 1px solid var(--line); background: #101216; display: none; }
+  #logwrap.show { display: block; }
+  #log {
+    height: 170px; overflow-y: auto; margin: 0; padding: 8px 12px;
+    font: 11.5px/1.55 Consolas, "Cascadia Mono", monospace; color: #9fb0c4;
+    white-space: pre-wrap; word-break: break-all;
+  }
+</style>
+</head>
+<body>
+
+<aside id="side">
+  <h1>llama-shell
+    <small>llama-server 管理外壳 · 界面由 llama.cpp 提供</small>
+  </h1>
+
+  <div class="scroll">
+    <div class="group">
+      <div class="label">模型</div>
+      <div id="models"></div>
+    </div>
+    <div class="group">
+      <div class="label">运行预设</div>
+      <div id="presets"></div>
+    </div>
+  </div>
+
+  <div id="controls">
+    <button id="btnStart" class="primary">启动</button>
+    <button id="btnStop" class="danger" style="margin-top:7px" disabled>停止</button>
+  </div>
+
+  <div id="status">
+    <div class="row"><span class="k">状态</span><span class="v"><span id="dot" class="dot"></span><span id="stText">未运行</span></span></div>
+    <div class="row"><span class="k">上下文</span><span class="v" id="stCtx">—</span></div>
+    <div class="row"><span class="k">运行时长</span><span class="v" id="stUp">—</span></div>
+    <div class="row"><span class="k">端口</span><span class="v" id="stPort">—</span></div>
+  </div>
+</aside>
+
+<main id="main">
+  <div id="bar">
+    <span id="barText">未连接</span>
+    <span class="spacer"></span>
+    <button id="btnReload" disabled>重载界面</button>
+    <button id="btnOpen" disabled>用浏览器打开</button>
+    <button id="btnLog">日志</button>
+  </div>
+
+  <div id="stage">
+    <webview id="frame" class="hidden" src="about:blank" allowpopups></webview>
+    <div id="placeholder">
+      <div class="big">◍</div>
+      <div>左侧选一个模型和预设,然后点「启动」</div>
+      <div style="font-size:12px;max-width:420px">
+        界面直接复用 llama.cpp 自带的 Web 聊天页,外壳只负责进程编排。
+      </div>
+    </div>
+  </div>
+
+  <div id="logwrap">
+    <pre id="log">(暂无日志)</pre>
+  </div>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+let CATALOGUE = null;
+let selModel = null;
+let selPreset = null;
+let busy = false;
+
+function fmtUptime(s) {
+  if (!s) return '—';
+  const m = Math.floor(s / 60);
+  return m < 1 ? `${s} 秒` : `${m} 分 ${s % 60} 秒`;
+}
+
+function renderModels() {
+  const box = $('models');
+  box.innerHTML = '';
+  for (const m of CATALOGUE.models) {
+    const b = document.createElement('button');
+    b.className = 'item' + (m.id === selModel ? ' sel' : '') + (m.present ? '' : ' missing');
+    b.innerHTML = `<div class="t">${m.name}</div>
+      <div class="d">${m.present ? m.note : '文件缺失: ' + m.file}</div>`;
+    if (m.present) {
+      b.onclick = () => {
+        selModel = m.id;
+        selPreset = m.defaultPreset;
+        renderModels(); renderPresets(); refreshButtons();
+      };
+    }
+    box.appendChild(b);
+  }
+}
+
+function renderPresets() {
+  const box = $('presets');
+  box.innerHTML = '';
+  for (const p of CATALOGUE.presets) {
+    const b = document.createElement('button');
+    b.className = 'item' + (p.key === selPreset ? ' sel' : '');
+    b.innerHTML = `<div class="t">${p.label}${p.vision ? ' · 视觉' : ''}</div>
+      <div class="d">${p.hint}</div>`;
+    b.onclick = () => { selPreset = p.key; renderPresets(); refreshButtons(); };
+    box.appendChild(b);
+  }
+}
+
+function refreshButtons() {
+  $('btnStart').disabled = busy || !selModel || !selPreset;
+  $('btnStart').textContent = busy ? '启动中…' : '启动';
+}
+
+function setDot(cls, text) {
+  $('dot').className = 'dot' + (cls ? ' ' + cls : '');
+  $('stText').textContent = text;
+}
+
+async function refresh() {
+  const s = await window.shell.status();
+  if (s.running) {
+    setDot('on', '运行中');
+    $('stCtx').textContent = s.ctx ? s.ctx.toLocaleString() + ' tokens' : '—';
+    $('stUp').textContent = fmtUptime(s.uptimeSec);
+    $('barText').textContent = `${s.modelName || ''} · ${s.preset || ''}`;
+    $('btnStop').disabled = false;
+    $('btnReload').disabled = false;
+    $('btnOpen').disabled = false;
+    showFrame(s.url);
+  } else {
+    setDot(busy ? 'busy' : '', busy ? '启动中' : '未运行');
+    $('stCtx').textContent = '—';
+    $('stUp').textContent = '—';
+    $('barText').textContent = '未连接';
+    $('btnStop').disabled = true;
+    $('btnReload').disabled = true;
+    $('btnOpen').disabled = true;
+    hideFrame();
+  }
+}
+
+// The webview is deliberately NOT re-navigated by the status poll.
+// Assigning `src` -- even to the identical value -- makes Electron start a
+// navigation, and the server's UI treats each one as a fresh session, which is
+// where the endless "New chat" tabs came from. Navigate only on a real change,
+// and remember what we actually loaded.
+let loadedUrl = null;
+let frameFailed = false;
+
+function showFrame(url) {
+  const f = $('frame');
+  $('placeholder').classList.add('hidden');
+  f.classList.remove('hidden');
+  if (loadedUrl === url) return;          // already showing it; do nothing
+  loadedUrl = url;
+  frameFailed = false;
+  f.setAttribute('src', url);
+}
+
+function hideFrame() {
+  const f = $('frame');
+  // Navigate away only if something is actually loaded. Re-assigning src every
+  // poll tick makes Electron launch (and then abort) a navigation each time.
+  if (loadedUrl !== null && loadedUrl !== 'about:blank') {
+    loadedUrl = 'about:blank';
+    frameFailed = false;
+    f.setAttribute('src', 'about:blank');
+  }
+  f.classList.add('hidden');
+  $('placeholder').classList.remove('hidden');
+}
+
+function initFrameDiagnostics() {
+  const f = $('frame');
+  f.addEventListener('did-fail-load', (e) => {
+    // -3 is ERR_ABORTED, which fires for our own 'about:blank' reset. Ignore it.
+    if (e.errorCode === -3) return;
+    frameFailed = true;
+    $('barText').textContent = '界面加载失败: ' + (e.errorDescription || e.errorCode);
+  });
+  f.addEventListener('did-finish-load', () => {
+    if (frameFailed) { frameFailed = false; refresh(); }
+  });
+}
+
+async function doStart() {
+  busy = true; refreshButtons(); setDot('busy', '启动中');
+  const r = await window.shell.start(selModel, selPreset);
+  busy = false; refreshButtons();
+  if (!r.ok) {
+    setDot('err', '启动失败');
+    $('barText').textContent = '启动失败';
+    await showLogs();
+    alert('启动失败:\n\n' + r.error);
+    return;
+  }
+  await refresh();
+}
+
+async function doStop() {
+  await window.shell.stop();
+  await refresh();
+}
+
+async function showLogs() {
+  const lines = await window.shell.logs();
+  $('log').textContent = lines.length ? lines.join('\n') : '(暂无日志)';
+  $('logwrap').classList.add('show');
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+(async function init() {
+  CATALOGUE = await window.shell.catalogue();
+  $('stPort').textContent = CATALOGUE.port;
+  // preselect the first available model
+  const first = CATALOGUE.models.find((m) => m.present);
+  if (first) { selModel = first.id; selPreset = first.defaultPreset; }
+  renderModels(); renderPresets(); refreshButtons();
+  await refresh();
+
+  $('btnStart').onclick = doStart;
+  $('btnStop').onclick = doStop;
+  $('btnReload').onclick = () => { $('frame').reload(); };
+  $('btnOpen').onclick = async () => {
+    const s = await window.shell.status();
+    if (s.url) window.open(s.url, '_blank');
+  };
+  $('btnLog').onclick = () => {
+    const w = $('logwrap');
+    w.classList.toggle('show');
+    if (w.classList.contains('show')) showLogs();
+  };
+
+  window.shell.onStateChanged(refresh);
+  initFrameDiagnostics();
+  // Poll only the sidebar status. Nothing here touches the webview.
+  setInterval(refresh, 4000);
+})();
+</script>
+</body>
+</html>

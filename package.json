@@ -1,0 +1,13 @@
+{
+  "name": "llama-shell",
+  "version": "0.1.0",
+  "description": "Minimal Electron shell that manages llama-server and hosts its built-in Web UI",
+  "main": "src/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^43.4.0"
+  }
+}
