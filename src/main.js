@@ -96,7 +96,8 @@ function stopServer() {
   });
 }
 
-/** 拉起服务并等它就绪。reasoningKey 缺省为 medium。 */
+/** 拉起服务并等它就绪。
+ *  reasoningKey 为 null/空时**不传** --reasoning-effort,由模型模板或界面自行决定。 */
 async function startServer(modelId, presetKey, reasoningKey) {
   await stopServer();
 
@@ -120,7 +121,7 @@ async function startServer(modelId, presetKey, reasoningKey) {
     detached: true,
     stdio: ['ignore', out, out],
   });
-  current = { modelId, preset: presetKey, reasoning: reasoningKey || 'medium', startedAt: Date.now() };
+  current = { modelId, preset: presetKey, reasoning: reasoningKey || null, startedAt: Date.now() };
 
   // 子进程已经有自己的句柄了;我们继续持有会每次启动漏一个 fd。
   try { fs.closeSync(out); } catch {}

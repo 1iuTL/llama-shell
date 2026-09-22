@@ -111,15 +111,20 @@ const MODELS = [
  *   --jinja             启用工具调用
  *   --temp/--top-p/--top-k  模型卡推荐的思考模式采样值
  *
- * 思考强度只有在用户明确选了档位时才传。'server-default' 会把参数完全去掉,
- * 交给模型自己的模板 —— 这一点很重要,因为不少模板默认就是最高档,
- * 否则会忽略界面上的选择器。
+ * reasoningKey 的三种取值:
+ *   未传 / null / 'server-default' —— 都不加 --reasoning-effort,由模型模板
+ *     或聊天界面里那个按对话的控件决定。这是默认行为。
+ *   其它已知档位 —— 加对应的 flag。
+ *
+ * 只有在明确要「服务级固定档位」时才传 reasoningKey。注意服务端 flag 会盖住
+ * 界面里按对话设置的档位,因为界面通常以请求参数下发,优先级低于服务端配置。
  */
 function buildArgs(model, presetKey, port, reasoningKey) {
   const preset = PRESETS[presetKey];
   if (!preset) throw new Error('未知的预设: ' + presetKey);
 
-  const reasoning = REASONING[reasoningKey] || REASONING['medium'];
+  // 没指定、或指定了「跟随模型默认」,都表示不加参数。
+  const reasoning = reasoningKey ? REASONING[reasoningKey] : null;
 
   const args = [
     '-m', model.file,
@@ -137,7 +142,7 @@ function buildArgs(model, presetKey, port, reasoningKey) {
     '--port', String(port),
   ];
 
-  if (reasoning.flag) {
+  if (reasoning && reasoning.flag) {
     args.push('--reasoning-effort', reasoning.flag);
   }
 

@@ -32,10 +32,32 @@
   #side h1 {
     font-size: 14px; margin: 0; padding: 14px 16px 12px;
     border-bottom: 1px solid var(--line); font-weight: 600; letter-spacing: .3px;
+    display: flex; align-items: flex-start; gap: 8px;
   }
+  #side h1 .titles { flex: 1; min-width: 0; }
   #side h1 small { display: block; color: var(--dim); font-weight: 400; font-size: 11px; margin-top: 3px; }
+  #btnSettings {
+    flex: 0 0 auto; width: 26px; height: 26px; padding: 0; line-height: 1;
+    font-size: 14px; border-radius: 6px;
+  }
+  #btnSettings.on { border-color: var(--accent); background: #1e2734; }
+
+  #settings { border-bottom: 1px solid var(--line); background: #171a1f; }
+  #settings.hidden { display: none; }
+  #settings .inner { padding: 12px 14px; }
+  #settings .opt {
+    display: flex; align-items: flex-start; gap: 8px; cursor: pointer;
+    padding: 7px 9px; border-radius: 6px;
+  }
+  #settings .opt:hover { background: rgba(128,128,128,.08); }
+  #settings .opt input { margin: 2px 0 0; cursor: pointer; }
+  #settings .opt .txt { flex: 1; }
+  #settings .opt .txt b { font-weight: 500; }
+  #settings .opt .txt span { display: block; color: var(--dim); font-size: 11px; margin-top: 2px; }
+
   .scroll { overflow-y: auto; flex: 1; }
   .group { padding: 12px 14px; border-bottom: 1px solid var(--line); }
+  .group.hidden { display: none; }
   .group > .label {
     color: var(--dim); font-size: 11px; letter-spacing: .6px; margin-bottom: 8px;
   }
@@ -112,9 +134,25 @@
 <body>
 
 <aside id="side">
-  <h1>llama-shell
-    <small>llama-server 管理外壳 · 界面由 llama.cpp 提供</small>
+  <h1>
+    <div class="titles">llama-shell
+      <small>llama-server 管理外壳 · 界面由 llama.cpp 提供</small>
+    </div>
+    <button id="btnSettings" title="外壳设置">⚙</button>
   </h1>
+
+  <div id="settings" class="hidden">
+    <div class="inner">
+      <label class="opt">
+        <input type="checkbox" id="optReasoning" />
+        <span class="txt">
+          <b>显示思考强度选择器</b>
+          <span>开启后侧栏多一栏,可固定「服务级」思考档位。关闭时外壳不传
+            <code>--reasoning-effort</code>,完全交给聊天界面里那个按对话设置的档位。</span>
+        </span>
+      </label>
+    </div>
+  </div>
 
   <div class="scroll">
     <div class="group">
@@ -125,7 +163,7 @@
       <div class="label">运行预设</div>
       <div id="presets"></div>
     </div>
-    <div class="group">
+    <div class="group hidden" id="reasoningGroup">
       <div class="label">思考强度</div>
       <div id="reasoning"></div>
     </div>
@@ -185,6 +223,34 @@ let loadedUrl = null;
 let frameFailed = false;
 
 const REASONING_STORE_KEY = 'llama-shell.reasoning';
+const SHOW_REASONING_KEY = 'llama-shell.showReasoning';
+
+// 侧栏的「思考强度」默认隐藏。
+//
+// 聊天界面自己就带一个按对话设置的档位(输入框 + 菜单里的 Reasoning),
+// 在这里再放一个「服务级」的容易打架,所以默认关掉 —— 外壳不传
+// --reasoning-effort,完全由界面决定。想要服务级固定档位时再打开。
+//
+// 注意:开启并选定档位后,服务端的 flag 会盖住界面里那个按对话的设置,
+// 因为界面里的选择通常以请求参数下发,而服务端 flag 优先级更高。
+// 需要按对话调节时,把这里关掉,或选「跟随模型默认」。
+function loadShowReasoning() {
+  try {
+    const v = localStorage.getItem(SHOW_REASONING_KEY);
+    if (v === '1') return true;
+    if (v === '0') return false;
+  } catch (e) { /* 忽略 */ }
+  return false;
+}
+function saveShowReasoning(v) {
+  try { localStorage.setItem(SHOW_REASONING_KEY, v ? '1' : '0'); } catch (e) { /* 忽略 */ }
+}
+
+function applyReasoningVisibility() {
+  const on = loadShowReasoning();
+  $('reasoningGroup').classList.toggle('hidden', !on);
+  $('optReasoning').checked = on;
+}
 
 function fmtUptime(s) {
   if (!s) return '—';
@@ -207,7 +273,7 @@ function loadReasoning() {
     const v = localStorage.getItem(REASONING_STORE_KEY);
     if (v && (CATALOGUE.reasoning || []).some((r) => r.key === v)) return v;
   } catch (e) { /* 忽略 */ }
-  return 'medium';
+  return 'server-default';
 }
 
 function renderModels() {
@@ -327,7 +393,9 @@ function initFrameDiagnostics() {
 
 async function doStart() {
   busy = true; refreshButtons(); setDot('busy', '启动中');
-  const r = await window.shell.start(selModel, selPreset, selReasoning);
+  // 选择器隐藏时不传思考档位,让界面自己控制。
+  const reasoning = loadShowReasoning() ? selReasoning : null;
+  const r = await window.shell.start(selModel, selPreset, reasoning);
   busy = false; refreshButtons();
   if (!r.ok) {
     setDot('err', '启动失败');
@@ -359,10 +427,20 @@ async function showLogs() {
   if (first) { selModel = first.id; selPreset = first.defaultPreset; }
   selReasoning = loadReasoning();
   renderModels(); renderPresets(); renderReasoning(); refreshButtons();
+  applyReasoningVisibility();
   await refresh();
 
   $('btnStart').onclick = doStart;
   $('btnStop').onclick = doStop;
+  $('btnSettings').onclick = () => {
+    const box = $('settings');
+    box.classList.toggle('hidden');
+    $('btnSettings').classList.toggle('on', !box.classList.contains('hidden'));
+  };
+  $('optReasoning').onchange = (e) => {
+    saveShowReasoning(e.target.checked);
+    applyReasoningVisibility();
+  };
   $('btnReload').onclick = () => { $('frame').reload(); };
   $('btnOpen').onclick = async () => {
     const s = await window.shell.status();
