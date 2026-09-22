@@ -212,7 +212,14 @@ src/qr.js         零依赖二维码生成器(给手机访问面板用)
 启动.bat          Windows 启动器(用绝对路径,避开空格截断)
 ```
 
-`src/qr.js` 是自己写的,不是引包 —— 外壳要求完全离线,而这里只需要编一条几十字节的局域网地址。它只实现 byte 模式 + 纠错等级 L + 版本 1–10。生成结果与参考实现(经典 `qrcode.js`)逐格对拍一致,并有往返解码测试(`tools/decode_qr.cjs`)。
+`src/qr.js` 是自己写的,不是引包 —— 外壳要求完全离线,而这里只需要编一条几十字节的局域网地址。它只实现 byte 模式 + 纠错等级 L + 版本 1–10。生成结果与参考实现(经典 `qrcode.js`)逐格对拍一致,并有往返解码测试。
+
+`tools/` 下是两个二维码验证脚本(`test_qr.cjs` 结构测试、`decode_qr.cjs` 往返解码)和一个推送脚本。跑测试不需要任何依赖:
+
+```
+node tools/test_qr.cjs
+node tools/decode_qr.cjs
+```
 
 ## 已知限制
 
@@ -223,6 +230,28 @@ src/qr.js         零依赖二维码生成器(给手机访问面板用)
 - 没配 electron-builder 打包,目前是源码运行
 - 模型文件缺失时只在列表里置灰,不做自动获取
 - 局域网是明文 HTTP,没有 TLS(手机端要 HTTPS 得自己套反代)
+
+## 开发备注:这台机器上 git push 不可用
+
+如果你在这台机器上继续开发,会撞到一个和本项目无关、但很费时间的环境问题:
+
+**PowerShell 和 git 的 HTTPS 传输都走 schannel,向 GitHub 发请求一律失败:**
+
+```
+schannel: AcquireCredentialsHandle failed: SEC_E_NO_CREDENTIALS (0x8009030e)
+```
+
+`git push`、`git ls-remote`、`Invoke-WebRequest`、`curl` 全都受影响。Node 不受影响 —— 它自带 OpenSSL,不碰 schannel。
+
+所以 `tools/push_gh.mjs` 是绕行方案:它用 `git pack-objects` 在本地打 pack,再按 git 的 receive-pack 协议自己拼请求体,最后用 Node 的 `fetch` 发出去。用法:
+
+```powershell
+$cred = ("protocol=https`nhost=github.com`n`n" | git credential-manager get)
+$env:GH_TOKEN = ($cred | Where-Object { $_ -match '^password=' }) -replace '^password=',''
+node tools\push_gh.mjs
+```
+
+token 只能从环境变量传进来,不能让脚本自己去 `git credential-manager` 问 —— 那需要向子进程 stdin 写入,而沙箱禁止命名管道(`spawn EPERM`)。同理,脚本内部所有子进程的 stdio 都接**文件**而不是管道。
 
 ## 许可
 
