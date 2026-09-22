@@ -194,20 +194,31 @@ if (lines.length) {
   console.log(resBuf.slice(0, 600).toString('utf8'))
 }
 
-// 校验:unpack ok,且目标 ref 回报的状态不是 ng。
+// 判定成功与否。
+//
+// 不靠解析 receive-pack 回包 —— 它掺着 side-band 的进度输出,格式因服务端
+// 而异,据它下结论容易误报(踩过:明明推成功了却报失败)。真正的权威信号是
+// 推送后远程 ref 指到了哪里,所以下面直接用 API 核实。
 const statusLine = lines.find((l) => l.startsWith('unpack ')) || ''
-const refLine = lines.find((l) => l.includes('refs/heads/')) || ''
-const unpackOk = /^unpack ok/.test(statusLine.replace(/\n$/, ''))
-const refNg = /(^|\s)ng\s/.test(refLine)
-const ok = res.status === 200 && unpackOk && !refNg && refLine.length > 0
+const refLine = lines.find((l) => /refs\/heads\//.test(l)) || ''
+const unpackOk = /unpack ok/.test(statusLine.replace(/\n$/, ''))
+const refRejected = /(^|\s)ng\s/.test(refLine)
+const reported = res.status === 200 && unpackOk && !refRejected
 
-if (ok) {
-  const after = await api(`/git/ref/heads/${BRANCH}`)
-  const now = after.status === 200 ? after.body.object.sha : '?'
-  console.log(`\n推送成功。远程 ${BRANCH} = ${now.slice(0, 7)}${now === head ? '  (与本地一致)' : '  !! 与本地不一致'}`)
+console.log('--- 判定 ---')
+console.log(`  HTTP ${res.status}, unpack: ${unpackOk ? 'ok' : (statusLine || '(未回报)')}, ref: ${refLine.trim() || '(未回报)'}`)
+
+const after = await api(`/git/ref/heads/${BRANCH}`)
+const now = after.status === 200 ? after.body.object.sha : null
+const landed = now === head
+
+if (landed) {
+  console.log(`\n推送成功。远程 ${BRANCH} = ${now.slice(0, 7)}  (与本地 HEAD 一致)`)
+} else if (reported) {
+  console.log(`\n回包说成功,但远程 ${BRANCH} 仍是 ${now ? now.slice(0, 7) : '(不存在)'}。请稍后重查。`)
 } else {
-  console.log('\n推送未成功,请检查上面的回包。')
+  console.log(`\n推送失败。远程 ${BRANCH} = ${now ? now.slice(0, 7) : '(不存在)'}`)
 }
 
 rmSync(TMP, { recursive: true, force: true })
-process.exit(ok ? 0 : 1)
+process.exit(landed ? 0 : 1)
