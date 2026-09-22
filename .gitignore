@@ -18,3 +18,4 @@ Desktop.ini
 *.bak-*
 .push-tmp/
 .probe-repo/
+.api-push-cache/
