@@ -78,10 +78,15 @@ const FLUSH = Buffer.from('0000', 'ascii')
 /**
  * 解析回包里的 pkt-line,返回文本行。
  *
- * 协商了 side-band-64k 之后,每条消息的 payload 前面会多一个**通道字节**:
- *   1 = 正常数据,2 = 进度信息,3 = 致命错误。
- * 不剥掉它,`unpack ok` 这类判定就会匹配失败(踩过一次 —— 明明推成功了
- * 却报失败)。
+ * 协商 side-band-64k 后是**两层**分帧,这点很反直觉:
+ *
+ *   0013                       <- 外层长度
+ *     01                       <- side-band 通道字节(1=状态, 2=进度, 3=致命)
+ *       000e                   <- 内层长度,又一层 pkt-line!
+ *         unpack ok\n
+ *
+ * 只剥通道字节会留下内层长度头,得到 "000eunpack ok" 这种字符串,
+ * 于是 `unpack ok` 判定永远匹配不上(踩过 —— 明明推成功却报失败)。
  */
 function parsePktLines(buf) {
   const lines = []
@@ -90,14 +95,25 @@ function parsePktLines(buf) {
     const len = parseInt(buf.slice(i, i + 4).toString('ascii'), 16)
     if (Number.isNaN(len)) break
     if (len === 0) { i += 4; continue }
-    if (len < 4) break
+    if (len < 4 || i + len > buf.length) break
+
     let payload = buf.slice(i + 4, i + len)
-    // 剥掉带内通道字节(1/2/3),它不属于文本内容
+    i += len
+
+    // 第一层:side-band 通道字节
     if (payload.length > 0 && payload[0] >= 1 && payload[0] <= 3) {
       payload = payload.slice(1)
+      // 第二层:内层 pkt-line 长度头。进度帧和内层长度头不一定同时存在,
+      // 所以先判断这 4 个字符是不是合法十六进制长度。
+      if (payload.length >= 4) {
+        const innerHex = payload.slice(0, 4).toString('ascii')
+        const innerLen = parseInt(innerHex, 16)
+        if (/^[0-9a-f]{4}$/i.test(innerHex) && !Number.isNaN(innerLen) && innerLen >= 4 && innerLen <= payload.length + 4) {
+          payload = payload.slice(4)
+        }
+      }
     }
     lines.push(payload.toString('utf8'))
-    i += len
   }
   return lines
 }
@@ -206,7 +222,7 @@ const refRejected = /(^|\s)ng\s/.test(refLine)
 const reported = res.status === 200 && unpackOk && !refRejected
 
 console.log('--- 判定 ---')
-console.log(`  HTTP ${res.status}, unpack: ${unpackOk ? 'ok' : (statusLine || '(未回报)')}, ref: ${refLine.trim() || '(未回报)'}`)
+console.log(`  HTTP ${res.status}   unpack: ${unpackOk ? 'ok' : (statusLine.trim() || '(未回报)')}   ref: ${refLine.trim() || '(未回报)'}`)
 
 const after = await api(`/git/ref/heads/${BRANCH}`)
 const now = after.status === 200 ? after.body.object.sha : null
