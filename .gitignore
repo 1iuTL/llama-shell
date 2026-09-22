@@ -16,3 +16,5 @@ Thumbs.db
 Desktop.ini
 *.bak
 *.bak-*
+.push-tmp/
+.probe-repo/
