@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
-<title>llama-shell</title>
+<title>llama-shell · 本地模型外壳</title>
 <style>
   :root {
     --bg: #14161a;
@@ -20,11 +20,11 @@
   html, body { height: 100%; margin: 0; }
   body {
     display: flex; background: var(--bg); color: var(--text);
-    font: 13px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+    font: 13px/1.5 "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
     overflow: hidden;
   }
 
-  /* ---------------------------------------------------------------- sidebar */
+  /* ---------------------------------------------------------------- 侧栏 */
   #side {
     width: 320px; flex: 0 0 320px; display: flex; flex-direction: column;
     background: var(--panel); border-right: 1px solid var(--line);
@@ -37,8 +37,7 @@
   .scroll { overflow-y: auto; flex: 1; }
   .group { padding: 12px 14px; border-bottom: 1px solid var(--line); }
   .group > .label {
-    color: var(--dim); font-size: 11px; text-transform: uppercase;
-    letter-spacing: .6px; margin-bottom: 8px;
+    color: var(--dim); font-size: 11px; letter-spacing: .6px; margin-bottom: 8px;
   }
 
   .item {
@@ -65,7 +64,7 @@
   button.primary:hover:not(:disabled) { background: #3d7ce8; }
   button.danger { background: #3a2020; border-color: #5a2b2b; color: #ffb4b4; }
 
-  /* ---------------------------------------------------------------- status */
+  /* ---------------------------------------------------------------- 状态 */
   #status { padding: 10px 14px; border-top: 1px solid var(--line); font-size: 12px; }
   .row { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
   .row .k { color: var(--dim); }
@@ -75,7 +74,7 @@
   .dot.busy { background: var(--warn); }
   .dot.err { background: var(--err); }
 
-  /* ------------------------------------------------------------------ main */
+  /* ---------------------------------------------------------------- 主区 */
   #main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
   #bar {
     height: 38px; flex: 0 0 38px; display: flex; align-items: center; gap: 10px;
@@ -100,7 +99,7 @@
     color: #c9d1d9; font-size: 12px;
   }
 
-  /* ------------------------------------------------------------------ log */
+  /* ---------------------------------------------------------------- 日志 */
   #logwrap { flex: 0 0 auto; border-top: 1px solid var(--line); background: #101216; display: none; }
   #logwrap.show { display: block; }
   #log {
@@ -159,7 +158,7 @@
     <div id="placeholder">
       <div class="big">◍</div>
       <div>左侧选一个模型和预设,然后点「启动」</div>
-      <div style="font-size:12px;max-width:420px">
+      <div style="font-size:12px;max-width:430px">
         界面直接复用 llama.cpp 自带的 Web 聊天页,外壳只负责进程编排。
       </div>
     </div>
@@ -171,6 +170,10 @@
 </main>
 
 <script>
+// 说明:webview 刻意**不**跟随状态轮询重新导航。
+// 给 src 赋值 —— 哪怕值完全一样 —— 也会让 Electron 发起一次导航,
+// 而服务端的界面把每次导航当成一次新会话,于是每隔几秒就多出一个
+// "New chat" 标签页。只在真正变化时导航,并记住实际加载过什么。
 const $ = (id) => document.getElementById(id);
 
 let CATALOGUE = null;
@@ -178,6 +181,10 @@ let selModel = null;
 let selPreset = null;
 let selReasoning = 'medium';
 let busy = false;
+let loadedUrl = null;
+let frameFailed = false;
+
+const REASONING_STORE_KEY = 'llama-shell.reasoning';
 
 function fmtUptime(s) {
   if (!s) return '—';
@@ -191,6 +198,18 @@ function reasonLabel(key) {
   return hit ? hit.label : (key || '—');
 }
 
+// 记住思考强度:它是两次运行之间最可能变化的一项。
+function saveReasoning() {
+  try { localStorage.setItem(REASONING_STORE_KEY, selReasoning); } catch (e) { /* 忽略 */ }
+}
+function loadReasoning() {
+  try {
+    const v = localStorage.getItem(REASONING_STORE_KEY);
+    if (v && (CATALOGUE.reasoning || []).some((r) => r.key === v)) return v;
+  } catch (e) { /* 忽略 */ }
+  return 'medium';
+}
+
 function renderModels() {
   const box = $('models');
   box.innerHTML = '';
@@ -198,7 +217,7 @@ function renderModels() {
     const b = document.createElement('button');
     b.className = 'item' + (m.id === selModel ? ' sel' : '') + (m.present ? '' : ' missing');
     b.innerHTML = `<div class="t">${m.name}</div>
-      <div class="d">${m.present ? m.note : '文件缺失: ' + m.file}</div>`;
+      <div class="d">${m.present ? m.note : '文件缺失:' + m.file}</div>`;
     if (m.present) {
       b.onclick = () => {
         selModel = m.id;
@@ -236,18 +255,6 @@ function renderReasoning() {
   }
 }
 
-// Persist the choice: it is the setting most likely to change between runs.
-function saveReasoning() {
-  try { localStorage.setItem('llama-shell.reasoning', selReasoning); } catch (e) { /* ignore */ }
-}
-function loadReasoning() {
-  try {
-    const v = localStorage.getItem('llama-shell.reasoning');
-    if (v && (CATALOGUE.reasoning || []).some((r) => r.key === v)) return v;
-  } catch (e) { /* ignore */ }
-  return 'medium';
-}
-
 function refreshButtons() {
   $('btnStart').disabled = busy || !selModel || !selPreset;
   $('btnStart').textContent = busy ? '启动中…' : '启动';
@@ -282,19 +289,11 @@ async function refresh() {
   }
 }
 
-// The webview is deliberately NOT re-navigated by the status poll.
-// Assigning `src` -- even to the identical value -- makes Electron start a
-// navigation, and the server's UI treats each one as a fresh session, which is
-// where the endless "New chat" tabs came from. Navigate only on a real change,
-// and remember what we actually loaded.
-let loadedUrl = null;
-let frameFailed = false;
-
 function showFrame(url) {
   const f = $('frame');
   $('placeholder').classList.add('hidden');
   f.classList.remove('hidden');
-  if (loadedUrl === url) return;          // already showing it; do nothing
+  if (loadedUrl === url) return;          // 已经在显示了,什么都不做
   loadedUrl = url;
   frameFailed = false;
   f.setAttribute('src', url);
@@ -302,8 +301,8 @@ function showFrame(url) {
 
 function hideFrame() {
   const f = $('frame');
-  // Navigate away only if something is actually loaded. Re-assigning src every
-  // poll tick makes Electron launch (and then abort) a navigation each time.
+  // 只有在真的加载了东西时才导航离开。每轮轮询都重新赋 src
+  // 会让 Electron 每次都发起(然后中止)一次导航。
   if (loadedUrl !== null && loadedUrl !== 'about:blank') {
     loadedUrl = 'about:blank';
     frameFailed = false;
@@ -316,10 +315,10 @@ function hideFrame() {
 function initFrameDiagnostics() {
   const f = $('frame');
   f.addEventListener('did-fail-load', (e) => {
-    // -3 is ERR_ABORTED, which fires for our own 'about:blank' reset. Ignore it.
+    // -3 是 ERR_ABORTED,我们自己把 src 复位成 about:blank 时就会触发,忽略。
     if (e.errorCode === -3) return;
     frameFailed = true;
-    $('barText').textContent = '界面加载失败: ' + (e.errorDescription || e.errorCode);
+    $('barText').textContent = '界面加载失败:' + (e.errorDescription || e.errorCode);
   });
   f.addEventListener('did-finish-load', () => {
     if (frameFailed) { frameFailed = false; refresh(); }
@@ -355,7 +354,7 @@ async function showLogs() {
 (async function init() {
   CATALOGUE = await window.shell.catalogue();
   $('stPort').textContent = CATALOGUE.port;
-  // preselect the first available model
+  // 预选第一个可用的模型
   const first = CATALOGUE.models.find((m) => m.present);
   if (first) { selModel = first.id; selPreset = first.defaultPreset; }
   selReasoning = loadReasoning();
@@ -377,7 +376,7 @@ async function showLogs() {
 
   window.shell.onStateChanged(refresh);
   initFrameDiagnostics();
-  // Poll only the sidebar status. Nothing here touches the webview.
+  // 只轮询侧栏状态,这里不碰 webview。
   setInterval(refresh, 4000);
 })();
 </script>

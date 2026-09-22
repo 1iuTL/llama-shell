@@ -1,13 +1,13 @@
-﻿// llama-shell -- a minimal Electron shell around llama-server.
+// llama-shell —— 一个围绕 llama-server 的极简 Electron 外壳。
 //
-// Responsibilities:
-//   1. pick a model + preset
-//   2. spawn the right llama-server build with the right flags
-//   3. wait until /health answers 200
-//   4. load the server's own Web UI in the main pane
-//   5. kill the child cleanly on stop/switch/quit
+// 职责:
+//   1. 选一个模型 + 预设(以及思考强度)
+//   2. 用正确的参数拉起对应的 llama-server 构建
+//   3. 轮询 /health,等它返回 200
+//   4. 在主区域加载服务自带的 Web UI
+//   5. 停止 / 切换 / 退出时把子进程收干净
 //
-// The chat UI itself is llama.cpp's built-in one; this shell only manages it.
+// 聊天界面本身来自 llama.cpp;这个外壳只负责管理它。
 const { app, BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
@@ -24,15 +24,15 @@ let child = null;
 let current = { modelId: null, preset: null, reasoning: null, startedAt: null };
 let logFile = null;
 
-// The child's output goes to a file rather than a pipe on purpose.
-// Piped stdio (Node's default) opens an anonymous pipe; some sandboxes refuse
-// that, and a failing pipe takes the whole Electron main process down with a
-// native null-pointer crash. Redirection has neither problem, and we can still
-// tail the file for the log pane.
+// 子进程的输出写进文件,而不是管道。
+// Node 默认的管道 stdio 会打开匿名管道,某些沙箱会拒绝;而管道一旦失败,
+// 整个 Electron 主进程会被原生崩溃带走。重定向没有这两个问题,
+// 而且我们仍然可以读取这个文件来喂日志面板。
 const LOG_DIR = path.join(__dirname, '..', 'logs');
 
-// ---------------------------------------------------------------- utilities
+// ---------------------------------------------------------------- 工具函数
 
+/** 读取日志文件末尾若干行。 */
 function readLogTail(maxLines = 250) {
   if (!logFile) return [];
   try {
@@ -44,6 +44,7 @@ function readLogTail(maxLines = 250) {
   }
 }
 
+/** 发一个 GET,把结果收敛成 { ok, status, body } —— 连不上不抛异常。 */
 function httpGet(url, timeoutMs = 2500) {
   return new Promise((resolve) => {
     const req = http.get(url, { timeout: timeoutMs }, (res) => {
@@ -58,6 +59,7 @@ function httpGet(url, timeoutMs = 2500) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/** 轮询 /health 直到就绪。模型加载通常 30-60 秒,给足 5 分钟。 */
 async function waitForHealth(timeoutMs = 300000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
@@ -77,8 +79,9 @@ function binExists(model) {
   try { return fs.existsSync(model.bin); } catch { return false; }
 }
 
-// ------------------------------------------------------------------ process
+// ------------------------------------------------------------------ 进程
 
+/** 停掉当前服务。先温和 kill,8 秒不退就强杀。 */
 function stopServer() {
   return new Promise((resolve) => {
     if (!child) { current = { modelId: null, preset: null, reasoning: null, startedAt: null }; return resolve(); }
@@ -86,21 +89,21 @@ function stopServer() {
     child = null;
     try {
       dying.kill();
-    } catch { /* already gone */ }
+    } catch { /* 已经没了 */ }
     const done = () => { current = { modelId: null, preset: null, reasoning: null, startedAt: null }; resolve(); };
-    // Escalate to a hard kill if it lingers.
     const t = setTimeout(() => { try { dying.kill('SIGKILL'); } catch {} ; done(); }, 8000);
     dying.once('exit', () => { clearTimeout(t); done(); });
   });
 }
 
+/** 拉起服务并等它就绪。reasoningKey 缺省为 medium。 */
 async function startServer(modelId, presetKey, reasoningKey) {
   await stopServer();
 
   const model = MODELS.find((m) => m.id === modelId);
-  if (!model) throw new Error(`鏈煡妯″瀷: ${modelId}`);
-  if (!modelExists(model)) throw new Error(`妯″瀷鏂囦欢涓嶅瓨鍦?\n${model.file}`);
-  if (!binExists(model)) throw new Error(`llama-server 涓嶅瓨鍦?\n${model.bin}`);
+  if (!model) throw new Error(`未知的模型标识: ${modelId}`);
+  if (!modelExists(model)) throw new Error(`模型文件不存在:\n${model.file}`);
+  if (!binExists(model)) throw new Error(`llama-server 不存在:\n${model.bin}`);
 
   const args = buildArgs(model, presetKey, PORT, reasoningKey);
 
@@ -110,8 +113,8 @@ async function startServer(modelId, presetKey, reasoningKey) {
   fs.writeFileSync(logFile, banner, 'utf8');
   const out = fs.openSync(logFile, 'a');
 
-  // detached: the child outlives a crashed shell rather than being torn down
-  // with it. stdio goes to a file, never a pipe.
+  // detached: 外壳崩了子进程也能活,而不是被一起带走。
+  // stdio 走文件,永远不走管道。
   child = spawn(model.bin, args, {
     windowsHide: true,
     detached: true,
@@ -119,16 +122,16 @@ async function startServer(modelId, presetKey, reasoningKey) {
   });
   current = { modelId, preset: presetKey, reasoning: reasoningKey || 'medium', startedAt: Date.now() };
 
-  // The child has its own handles now; holding ours would leak one fd per start.
+  // 子进程已经有自己的句柄了;我们继续持有会每次启动漏一个 fd。
   try { fs.closeSync(out); } catch {}
   try { child.unref(); } catch {}
 
   child.on('error', (err) => {
-    try { fs.appendFileSync(logFile, `[shell] spawn error: ${err.message}\n`); } catch {}
+    try { fs.appendFileSync(logFile, `[shell] 启动子进程失败: ${err.message}\n`); } catch {}
   });
 
   child.on('exit', (code) => {
-    try { fs.appendFileSync(logFile, `[shell] server exited with code ${code}\n`); } catch {}
+    try { fs.appendFileSync(logFile, `[shell] 服务退出,code=${code}\n`); } catch {}
     if (child) { child = null; current = { modelId: null, preset: null, reasoning: null, startedAt: null }; }
     notifyRenderer();
   });
@@ -137,13 +140,13 @@ async function startServer(modelId, presetKey, reasoningKey) {
   if (!ok) {
     const tail = readLogTail(14).join('\n');
     await stopServer();
-    throw new Error(`鏈嶅姟鍚姩澶辫触鎴栬秴鏃躲€傛棩蹇楁湯灏?\n${tail}`);
+    throw new Error(`服务启动失败或超时。日志末尾:\n${tail}`);
   }
-  try { fs.appendFileSync(logFile, '[shell] server ready\n'); } catch {}
-  return { url: `${BASE}/`, modelId, preset: presetKey };
+  try { fs.appendFileSync(logFile, '[shell] 服务就绪\n'); } catch {}
+  return { url: `${BASE}/`, modelId, preset: presetKey, reasoning: current.reasoning };
 }
 
-// -------------------------------------------------------------------- render
+// ------------------------------------------------------------------ 渲染层
 
 function notifyRenderer() {
   if (win && !win.isDestroyed()) win.webContents.send('state-changed');
@@ -156,12 +159,12 @@ function createWindow() {
     minWidth: 940,
     minHeight: 620,
     backgroundColor: '#14161a',
-    title: 'llama-shell',
+    title: 'llama-shell · 本地模型外壳',
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
       nodeIntegration: false,
-      webviewTag: true,      // the right pane is a <webview> onto llama-server
+      webviewTag: true,      // 右侧主区域是一个指向 llama-server 的 <webview>
       spellcheck: false,
     },
   });
@@ -170,7 +173,7 @@ function createWindow() {
   win.on('closed', () => { win = null; });
 }
 
-// ----------------------------------------------------------------------- IPC
+// --------------------------------------------------------------------- IPC
 
 ipcMain.handle('catalogue', () => ({
   models: MODELS.map((m) => ({
@@ -182,11 +185,11 @@ ipcMain.handle('catalogue', () => ({
     present: modelExists(m),
     binPresent: binExists(m),
   })),
-  reasoning: Object.entries(REASONING).map(([k, v]) => ({
-    key: k, label: v.label, hint: v.hint, flag: v.flag,
-  })),
   presets: Object.entries(PRESETS).map(([k, v]) => ({
     key: k, label: v.label, hint: v.hint, ctx: v.ctx, vision: v.vision,
+  })),
+  reasoning: Object.entries(REASONING).map(([k, v]) => ({
+    key: k, label: v.label, hint: v.hint, flag: v.flag,
   })),
   port: PORT,
 }));
@@ -224,19 +227,18 @@ ipcMain.handle('status', async () => {
 
 ipcMain.handle('logs', () => readLogTail(250));
 
-// ---------------------------------------------------------------- lifecycle
+// ------------------------------------------------------------------ 生命周期
 
 app.whenReady().then(async () => {
   createWindow();
 
-  // Self-test hook: LLAMA_SHELL_AUTOSTART="<modelId>:<preset>" boots a server
-  // immediately on launch. Used to verify the spawn -> health -> UI chain
-  // without clicking anything; harmless when the variable is unset.
+  // 自测开关:LLAMA_SHELL_AUTOSTART="<模型id>:<预设>[:<思考强度>]" 会在启动时
+  // 立刻拉起一个服务,用来在不点任何按钮的情况下验证 拉起→健康检查→界面 这条链路。
+  // 不设这个变量时完全无副作用。
   const auto = process.env.LLAMA_SHELL_AUTOSTART;
   if (auto) {
     const [modelId, preset, reasoning] = auto.split(':');
-    // Wait for the window to finish loading so the renderer exists before we
-    // start emitting state changes.
+    // 等窗口加载完,免得在渲染层还不存在时就发状态变更。
     try {
       await new Promise((r) => {
         if (!win || win.webContents.isLoadingMainFrame()) {
@@ -244,16 +246,16 @@ app.whenReady().then(async () => {
         } else r();
       });
     } catch {}
-    console.log('[shell] autostart', modelId, preset);
+    console.log('[shell] 自测启动', modelId, preset, reasoning || '(默认思考强度)');
     try {
       await startServer(modelId, preset, reasoning);
-      console.log('[shell] autostart OK');
+      console.log('[shell] 自测启动成功');
       notifyRenderer();
     } catch (e) {
-      console.error('[shell] autostart FAILED:', e.message);
+      console.error('[shell] 自测启动失败:', e.message);
       if (win && !win.isDestroyed()) {
         win.webContents.executeJavaScript(
-          `alert(${JSON.stringify('鑷祴鍚姩澶辫触:\n\n' + e.message)})`).catch(() => {});
+          `alert(${JSON.stringify('自测启动失败:\n\n' + e.message)})`).catch(() => {});
       }
     }
   }
@@ -264,8 +266,7 @@ app.on('window-all-closed', async () => {
   app.quit();
 });
 
-// Make sure the child never outlives the shell.
+// 确保子进程不会比外壳活得更久。
 app.on('before-quit', () => {
   if (child) { try { child.kill(); } catch {} }
 });
-

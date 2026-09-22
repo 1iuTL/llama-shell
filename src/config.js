@@ -1,16 +1,15 @@
-// Model + preset catalogue.
-// Edit this file to add models or tweak launch flags -- nothing else needs to change.
+// 模型与预设清单。
+// 平时只改这个文件就能增删模型、调整启动参数 —— 其它源码不用动。
 const path = require('path');
 
 const MODELS_DIR = 'D:\\';
 
-// Where the two llama.cpp builds and the model files live.
-// Absolute on purpose: this shell sits beside that tree, not inside it.
+// 两个 llama.cpp 构建并排放着:
+//   prism —— PrismML 的 fork,是唯一能读 PTQ1_0(三进制)权重的构建
+//   stock —— ggml-org 上游构建,读标准 Q1_0(1-bit)
+// 路径写成绝对路径是有意的:这个外壳放在那棵目录树**旁边**,不在里面。
 const WORKSPACE = 'C:\\deepseek harness\\models';
 
-// Two llama.cpp builds live side by side:
-//   prism  - PrismML fork, the ONLY build that can read PTQ1_0 (ternary) weights
-//   stock  - upstream ggml-org build, reads standard Q1_0 (1-bit)
 const BIN = {
   prism: path.join(WORKSPACE, 'llama-prism', 'llama-server.exe'),
   stock: path.join(WORKSPACE, 'llama-cpp', 'llama-server.exe'),
@@ -18,8 +17,8 @@ const BIN = {
 
 const MMPROJ = 'D:\\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf';
 
-// Vision adds ~0.9 GiB (projector kept in RAM) plus image tokens, so it is
-// paired with a smaller context on an 8 GB card.
+// 视觉能力会多占约 0.9 GiB(投影器放内存)外加图片 token,
+// 所以在 8 GB 卡上给它配了更小的上下文。
 const PRESETS = {
   'text-64k': {
     label: '长文本 64K',
@@ -51,13 +50,12 @@ const PRESETS = {
   },
 };
 
-// Thinking levels the sidebar can request, mapped to llama-server's flag.
+// 侧栏可选的思考强度,映射到 llama-server 的参数。
 //
-// This is deliberately user-selectable rather than hardcoded. An earlier
-// version pinned `--reasoning-effort medium` unconditionally, which silently
-// overrode whatever thinking level the chat UI sent -- picking "high" still
-// produced shallow thinking. Pass 'server-default' to send no flag at all and
-// let the model's own chat template decide.
+// 这里刻意做成**用户可选**而不是写死。早先的版本无条件钉上
+// `--reasoning-effort medium`,结果静默覆盖了聊天界面发出的思考档位 ——
+// 选了「高」也照样只有浅思考。选 'server-default' 则完全不带参数,
+// 由模型自己的聊天模板决定。
 const REASONING = {
   'server-default': { label: '跟随模型默认', hint: '不加参数,由模板决定', flag: null },
   off: { label: '关闭思考', hint: '最快,不产出思考内容', flag: 'none' },
@@ -66,7 +64,7 @@ const REASONING = {
   high: { label: '高', hint: '深思考,更慢', flag: 'high' },
 };
 
-// Every model here was downloaded and verified in this workspace.
+// 这里的每个模型都已经在本机下载并校验过。
 const MODELS = [
   {
     id: 'ternary',
@@ -78,7 +76,7 @@ const MODELS = [
   },
   {
     id: 'ternary-heretic',
-    name: '三元版 · 去审查 (Heretic)',
+    name: '三元版 · 去审查(Heretic)',
     note: 'PTQ1_0 · 5.54 GB · 拒答率大幅降低',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Heretic-PTQ1_0.gguf',
     bin: BIN.prism,
@@ -86,7 +84,7 @@ const MODELS = [
   },
   {
     id: 'ternary-abliterated',
-    name: '三元版 · 去审查 (Abliterated)',
+    name: '三元版 · 去审查(Abliterated)',
     note: 'PTQ1_0 · 5.54 GB · 实测零拒答',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf',
     bin: BIN.prism,
@@ -103,21 +101,23 @@ const MODELS = [
 ];
 
 /**
- * Build the llama-server argv for a model + preset.
+ * 为「模型 + 预设」拼出 llama-server 的命令行。
  *
- * The flags below are the community 8 GB-tier configuration
- * (sudoingX/bonsai2-small-gpu). Each one earns its place:
- *   -fa on              flash attention, drops the compute buffer
- *   -np 1               single slot; extra slots waste ~450 MiB each
- *   -ctk q4_0 -ctv q4_0 KV cache at 1/4 size -- this is what makes 64K fit
- *   --reasoning-effort  this model's template defaults to unbounded thinking,
- *                       which burns the whole context and returns nothing
- *   --jinja             tool calls
- *   --temp/--top-p/--top-k  the model card's thinking-mode sampling values
+ * 下面这些参数是 8 GB 显存档位的社区配置
+ * (sudoingX/bonsai2-small-gpu)。每一条都有理由:
+ *   -fa on              flash attention,省掉计算缓冲
+ *   -np 1               单槽位;多一个槽位白吃约 450 MiB
+ *   -ctk q4_0 -ctv q4_0 KV cache 压到 1/4 —— 64K 能塞进 8GB 全靠这个
+ *   --jinja             启用工具调用
+ *   --temp/--top-p/--top-k  模型卡推荐的思考模式采样值
+ *
+ * 思考强度只有在用户明确选了档位时才传。'server-default' 会把参数完全去掉,
+ * 交给模型自己的模板 —— 这一点很重要,因为不少模板默认就是最高档,
+ * 否则会忽略界面上的选择器。
  */
 function buildArgs(model, presetKey, port, reasoningKey) {
   const preset = PRESETS[presetKey];
-  if (!preset) throw new Error('unknown preset: ' + presetKey);
+  if (!preset) throw new Error('未知的预设: ' + presetKey);
 
   const reasoning = REASONING[reasoningKey] || REASONING['medium'];
 
@@ -137,9 +137,6 @@ function buildArgs(model, presetKey, port, reasoningKey) {
     '--port', String(port),
   ];
 
-  // Only sent when the user actually picked a level. 'server-default' leaves the
-  // model's own template in charge -- important, because several templates
-  // default to their highest level and would otherwise ignore a UI selector.
   if (reasoning.flag) {
     args.push('--reasoning-effort', reasoning.flag);
   }
