@@ -17,6 +17,7 @@
 // token 从 GH_TOKEN 环境变量读(不用管道问 credential-manager —— 沙箱禁止命名管道)。
 import { spawn } from 'node:child_process'
 import { openSync, closeSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs'
+import { setTimeout as sleep } from 'node:timers/promises'
 
 const OWNER = '1iuTL'
 const REPO = 'model-stove'
@@ -183,11 +184,37 @@ console.log(`请求体: ${(body.length / 1024).toFixed(1)} KB`)
 
 // ---------------------------------------------------------------- 3. 上传
 
+/**
+ * 带重试的 POST。
+ *
+ * 国内直连 github.com:443 经常第一次握手就超时(undici 默认 10 秒),
+ * 但重试往往就通了 —— 手动重跑整个脚本既慢又容易误判成败,所以内置重试。
+ * 只重试**连接层**错误;HTTP 状态码返回什么就是什么,那是服务端的回答。
+ */
+async function postWithRetry(url, init, attempts = 4) {
+  let lastErr = null
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      return await fetch(url, init)
+    } catch (e) {
+      lastErr = e
+      const cause = e && e.cause ? (e.cause.code || e.cause.message) : e.message
+      console.log(`  第 ${i}/${attempts} 次失败: ${cause}`)
+      if (i < attempts) {
+        const waitMs = 2000 * i
+        console.log(`  ${waitMs / 1000} 秒后重试 ...`)
+        await sleep(waitMs)
+      }
+    }
+  }
+  throw lastErr
+}
+
 console.log('上传中 ...')
 const url = `https://github.com/${OWNER}/${REPO}.git/git-receive-pack`
 const auth = Buffer.from(`${OWNER}:${token}`, 'utf8').toString('base64')
 
-const res = await fetch(url, {
+const res = await postWithRetry(url, {
   method: 'POST',
   headers: {
     Authorization: `Basic ${auth}`,
