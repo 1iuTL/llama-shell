@@ -42,7 +42,7 @@
   }
   #btnSettings.on { border-color: var(--accent); background: #1e2734; }
 
-  #settings { border-bottom: 1px solid var(--line); background: #171a1f; }
+  #settings { border-bottom: 1px solid var(--line); background: #171a1f; max-height: 62vh; overflow-y: auto; }
   #settings.hidden { display: none; }
   #settings .inner { padding: 12px 14px; }
   #settings .opt {
@@ -54,6 +54,59 @@
   #settings .opt .txt { flex: 1; }
   #settings .opt .txt b { font-weight: 500; }
   #settings .opt .txt span { display: block; color: var(--dim); font-size: 11px; margin-top: 2px; }
+
+  /* ------------------------------------------------------------ 设置:分区 */
+  #settings .sec {
+    margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line);
+  }
+  #settings .sec > .h {
+    font-size: 11px; color: var(--dim); letter-spacing: .5px; margin-bottom: 7px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  #settings .sec > .h .spacer { flex: 1; }
+  #settings input[type=text], #settings input[type=password] {
+    width: 100%; padding: 7px 9px; border-radius: 6px; border: 1px solid var(--line);
+    background: #10131a; color: var(--text); font: 12px/1.4 Consolas, "Cascadia Mono", monospace;
+  }
+  #settings input[type=text]:focus, #settings input[type=password]:focus {
+    outline: none; border-color: var(--accent);
+  }
+  #settings .btnrow { display: flex; gap: 6px; margin-top: 6px; }
+  #settings .btnrow button {
+    flex: 1; width: auto; padding: 6px 8px; font-size: 12px; font-weight: 400;
+  }
+  #settings .note { color: var(--dim); font-size: 11px; margin-top: 6px; }
+  #settings .note b { color: var(--warn); font-weight: 500; }
+
+  /* 局域网访问:地址列表 + 二维码 */
+  .lanurl {
+    display: flex; align-items: center; gap: 6px; margin-bottom: 5px;
+    background: #10131a; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px;
+  }
+  .lanurl .u {
+    flex: 1; font: 11.5px/1.3 Consolas, "Cascadia Mono", monospace;
+    word-break: break-all; color: #c9d1d9;
+  }
+  .lanurl .n { color: var(--dim); font-size: 10.5px; flex: 0 0 auto; }
+  .lanurl button {
+    width: auto; flex: 0 0 auto; padding: 3px 8px; font-size: 11px; font-weight: 400;
+  }
+  #qrbox {
+    margin-top: 8px; background: #fff; border-radius: 8px; padding: 8px;
+    width: 176px; height: 176px; align-self: center;
+  }
+  #qrbox.hidden { display: none; }
+  #qrbox svg { display: block; }
+  #qrwhy { color: var(--dim); font-size: 11px; margin-top: 6px; text-align: center; }
+  #qrwhy.hidden { display: none; }
+
+  /* 手机访问步骤 */
+  ol.steps { margin: 6px 0 0; padding-left: 18px; color: var(--dim); font-size: 11px; }
+  ol.steps li { margin-bottom: 3px; }
+  ol.steps code {
+    background: var(--panel-2); padding: 1px 4px; border-radius: 3px;
+    color: #c9d1d9; font-size: 11px;
+  }
 
   .scroll { overflow-y: auto; flex: 1; }
   .group { padding: 12px 14px; border-bottom: 1px solid var(--line); }
@@ -151,6 +204,45 @@
             <code>--reasoning-effort</code>,完全交给聊天界面里那个按对话设置的档位。</span>
         </span>
       </label>
+
+      <div class="sec">
+        <div class="h">API KEY
+          <span class="spacer"></span>
+        </div>
+        <input type="text" id="inpKey" placeholder="留空 = 不鉴权(仅本机可用)" spellcheck="false" />
+        <div class="btnrow">
+          <button id="btnGenKey">生成随机</button>
+          <button id="btnSaveKey" class="primary">保存</button>
+          <button id="btnClearKey">清除</button>
+        </div>
+        <div class="note">
+          设置后,llama-server 的所有接口都要带这个 Key。
+          <br />聊天界面自己认识它 —— 手机上第一次打开会弹出输入框,填一次即存住。
+          <br /><b>注意:留空且开启局域网时,同网段任何人都能直接用你的模型。</b>
+        </div>
+      </div>
+
+      <div class="sec">
+        <div class="h">局域网访问
+          <span class="spacer"></span>
+          <button id="btnRefreshNet" style="width:auto;padding:3px 8px;font-size:11px;font-weight:400">刷新地址</button>
+        </div>
+        <label class="opt" style="padding:4px 0">
+          <input type="checkbox" id="optLan" />
+          <span class="txt">
+            <b>允许其它设备连接</b>
+            <span>关闭时只监听 127.0.0.1,手机连不上。改动后需要重新启动服务。</span>
+          </span>
+        </label>
+        <div id="lanList"></div>
+        <div id="qrbox" class="hidden"></div>
+        <div id="qrwhy" class="hidden">手机扫码打开</div>
+        <ol class="steps">
+          <li>让手机和电脑处在<code>同一个热点</code>下(校园网常隔离设备,热点最稳)</li>
+          <li>手机连上后,扫上面的码或手输地址</li>
+          <li>首次打开会要 API Key,填一次即可</li>
+        </ol>
+      </div>
     </div>
   </div>
 
@@ -207,6 +299,7 @@
   </div>
 </main>
 
+<script src="qr.js"></script>
 <script>
 // 说明:webview 刻意**不**跟随状态轮询重新导航。
 // 给 src 赋值 —— 哪怕值完全一样 —— 也会让 Electron 发起一次导航,
@@ -395,7 +488,9 @@ async function doStart() {
   busy = true; refreshButtons(); setDot('busy', '启动中');
   // 选择器隐藏时不传思考档位,让界面自己控制。
   const reasoning = loadShowReasoning() ? selReasoning : null;
-  const r = await window.shell.start(selModel, selPreset, reasoning);
+  // 局域网开关从设置里读,和 API Key 一起生效。
+  const lanMode = !!SETTINGS.lanMode;
+  const r = await window.shell.start(selModel, selPreset, reasoning, lanMode);
   busy = false; refreshButtons();
   if (!r.ok) {
     setDot('err', '启动失败');
@@ -410,6 +505,99 @@ async function doStart() {
 async function doStop() {
   await window.shell.stop();
   await refresh();
+}
+
+// ------------------------------------------------------------------ 设置面板
+
+let SETTINGS = { apiKey: '', lanMode: false, addresses: [] };
+
+/**
+ * 重画局域网地址列表。
+ *
+ * 会列出所有非回环 IPv4,因为这台机器通常同时挂着 WiFi 和热点虚拟网卡,
+ * 而哪个能通取决于手机连的是哪个网络 —— 猜不出来,所以全列出来。
+ * 默认把第一个放进二维码:多数情况下那是对的那个(热点优先)。
+ */
+function renderLan() {
+  const box = $('lanList');
+  const list = (SETTINGS.addresses || []);
+  box.innerHTML = '';
+
+  if (!SETTINGS.lanMode) {
+    box.innerHTML = '<div class="note">局域网访问已关闭。开启后才能用手机连接。</div>';
+    $('qrbox').classList.add('hidden');
+    $('qrwhy').classList.add('hidden');
+    return;
+  }
+  if (!list.length) {
+    box.innerHTML = '<div class="note">没找到可用的局域网地址。先连上 WiFi 或开热点,再点「刷新地址」。</div>';
+    $('qrbox').classList.add('hidden');
+    $('qrwhy').classList.add('hidden');
+    return;
+  }
+
+  list.forEach((a, i) => {
+    const row = document.createElement('div');
+    row.className = 'lanurl';
+    row.innerHTML = `<span class="u"></span><span class="n"></span>`;
+    // 用 textContent 而不是 innerHTML:网卡名和地址都是外部数据
+    row.querySelector('.u').textContent = a.url;
+    row.querySelector('.n').textContent = a.name;
+    const copy = document.createElement('button');
+    copy.textContent = '复制';
+    copy.onclick = () => {
+      navigator.clipboard.writeText(a.url).then(
+        () => { copy.textContent = '已复制'; setTimeout(() => (copy.textContent = '复制'), 1200); },
+        () => { copy.textContent = '失败'; setTimeout(() => (copy.textContent = '复制'), 1200); }
+      );
+    };
+    row.appendChild(copy);
+    box.appendChild(row);
+  });
+
+  renderQr(list[0].url);
+}
+
+/**
+ * 把第一个地址画成二维码。
+ *
+ * 刻意**不**把 API Key 编进码里:二维码会被截图、会被别人看到,
+ * 而 Key 只该由用户在手机上亲手输一次。码里只有地址。
+ */
+function renderQr(url) {
+  const box = $('qrbox');
+  const why = $('qrwhy');
+  try {
+    box.innerHTML = window.ModelStoveQR.toSvg(url, { quiet: 1 });
+    box.classList.remove('hidden');
+    why.textContent = '扫码打开 · ' + url;
+    why.classList.remove('hidden');
+  } catch (e) {
+    // 地址太长或二维码模块出错时,不该把整个设置面板拖垮
+    box.classList.add('hidden');
+    why.textContent = '二维码生成失败:' + e.message;
+    why.classList.remove('hidden');
+  }
+}
+
+async function loadSettingsToUi() {
+  SETTINGS = await window.shell.getSettings();
+  $('inpKey').value = SETTINGS.apiKey || '';
+  $('optLan').checked = !!SETTINGS.lanMode;
+  renderLan();
+}
+
+async function refreshNet() {
+  SETTINGS.addresses = await window.shell.addresses();
+  renderLan();
+}
+
+/** 按钮上短暂显示一句反馈,然后恢复原文案。 */
+function flash(id, text) {
+  const b = $(id);
+  const old = b.textContent;
+  b.textContent = text;
+  setTimeout(() => { if (b.textContent === text) b.textContent = old; }, 1200);
 }
 
 async function showLogs() {
@@ -428,6 +616,7 @@ async function showLogs() {
   selReasoning = loadReasoning();
   renderModels(); renderPresets(); renderReasoning(); refreshButtons();
   applyReasoningVisibility();
+  await loadSettingsToUi();
   await refresh();
 
   $('btnStart').onclick = doStart;
@@ -440,6 +629,44 @@ async function showLogs() {
   $('optReasoning').onchange = (e) => {
     saveShowReasoning(e.target.checked);
     applyReasoningVisibility();
+  };
+
+  // ---- API Key ----
+  $('btnGenKey').onclick = async () => {
+    const r = await window.shell.genKey();
+    SETTINGS.apiKey = r.apiKey;
+    $('inpKey').value = r.apiKey;
+    flash('btnGenKey', '已生成');
+  };
+  $('btnSaveKey').onclick = async () => {
+    const r = await window.shell.setSettings({ apiKey: $('inpKey').value });
+    SETTINGS.apiKey = r.apiKey;
+    $('inpKey').value = r.apiKey;
+    flash('btnSaveKey', '已保存');
+    // Key 改了,正在跑的服务还用着旧的,得重起才生效。
+    const s = await window.shell.status();
+    if (s.running) {
+      $('barText').textContent = 'API Key 已改 · 重启服务后生效';
+    }
+  };
+  $('btnClearKey').onclick = async () => {
+    const r = await window.shell.setSettings({ apiKey: '' });
+    SETTINGS.apiKey = r.apiKey;
+    $('inpKey').value = '';
+    flash('btnClearKey', '已清除');
+  };
+
+  // ---- 局域网 ----
+  $('optLan').onchange = async (e) => {
+    const r = await window.shell.setSettings({ lanMode: e.target.checked });
+    SETTINGS.lanMode = r.lanMode;
+    renderLan();
+    const s = await window.shell.status();
+    if (s.running) $('barText').textContent = '局域网开关已改 · 重启服务后生效';
+  };
+  $('btnRefreshNet').onclick = async () => {
+    await refreshNet();
+    flash('btnRefreshNet', '已刷新');
   };
   $('btnReload').onclick = () => { $('frame').reload(); };
   $('btnOpen').onclick = async () => {

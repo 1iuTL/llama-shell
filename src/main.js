@@ -11,17 +11,19 @@
 const { app, BrowserWindow, ipcMain } = require('electron');
 const { spawn } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
 const http = require('http');
 
 const { MODELS, PRESETS, REASONING, buildArgs } = require('./config');
+const settings = require('./settings');
 
 const PORT = 8091;
 const BASE = `http://127.0.0.1:${PORT}`;
 
 let win = null;
 let child = null;
-let current = { modelId: null, preset: null, reasoning: null, startedAt: null };
+let current = { modelId: null, preset: null, reasoning: null, lanMode: false, startedAt: null };
 let logFile = null;
 
 // 子进程的输出写进文件,而不是管道。
@@ -79,26 +81,49 @@ function binExists(model) {
   try { return fs.existsSync(model.bin); } catch { return false; }
 }
 
+/**
+ * 列出本机可用的 IPv4 地址,给「手机怎么连」那块界面用。
+ *
+ * 会同时给出好几个,因为这台机器经常同时挂着 WiFi、有线、以及热点虚拟网卡,
+ * 而**哪个能通取决于手机连的是哪个网络** —— 光看名字猜不出来,所以全列出来
+ * 让用户自己试。跳过回环地址(手机连不上 127.0.0.1)和已断开的网卡。
+ */
+function localAddresses(port) {
+  const out = [];
+  const ifaces = os.networkInterfaces();
+  for (const [name, addrs] of Object.entries(ifaces)) {
+    for (const a of addrs || []) {
+      // Node 18+ 的 family 是数字 4,老版本是字符串 'IPv4'。两种都认。
+      const isV4 = a.family === 4 || a.family === 'IPv4';
+      if (!isV4 || a.internal) continue;
+      out.push({ name, address: a.address, url: `http://${a.address}:${port}/` });
+    }
+  }
+  return out;
+}
+
 // ------------------------------------------------------------------ 进程
 
 /** 停掉当前服务。先温和 kill,8 秒不退就强杀。 */
 function stopServer() {
   return new Promise((resolve) => {
-    if (!child) { current = { modelId: null, preset: null, reasoning: null, startedAt: null }; return resolve(); }
+    if (!child) { current = { modelId: null, preset: null, reasoning: null, lanMode: false, startedAt: null }; return resolve(); }
     const dying = child;
     child = null;
     try {
       dying.kill();
     } catch { /* 已经没了 */ }
-    const done = () => { current = { modelId: null, preset: null, reasoning: null, startedAt: null }; resolve(); };
+    const done = () => { current = { modelId: null, preset: null, reasoning: null, lanMode: false, startedAt: null }; resolve(); };
     const t = setTimeout(() => { try { dying.kill('SIGKILL'); } catch {} ; done(); }, 8000);
     dying.once('exit', () => { clearTimeout(t); done(); });
   });
 }
 
 /** 拉起服务并等它就绪。
- *  reasoningKey 为 null/空时**不传** --reasoning-effort,由模型模板或界面自行决定。 */
-async function startServer(modelId, presetKey, reasoningKey) {
+ *  reasoningKey 为 null/空时**不传** --reasoning-effort,由模型模板或界面自行决定。
+ *  lanMode 为 true 时监听 0.0.0.0,手机等其它设备才能连上。
+ *  apiKey 从本地设置里读,非空则加 --api-key 给所有接口上锁。 */
+async function startServer(modelId, presetKey, reasoningKey, lanMode) {
   await stopServer();
 
   const model = MODELS.find((m) => m.id === modelId);
@@ -106,11 +131,15 @@ async function startServer(modelId, presetKey, reasoningKey) {
   if (!modelExists(model)) throw new Error(`模型文件不存在:\n${model.file}`);
   if (!binExists(model)) throw new Error(`llama-server 不存在:\n${model.bin}`);
 
-  const args = buildArgs(model, presetKey, PORT, reasoningKey);
+  const apiKey = (settings.readSettings().apiKey || '').trim();
+  const args = buildArgs(model, presetKey, PORT, reasoningKey, lanMode, apiKey);
 
   fs.mkdirSync(LOG_DIR, { recursive: true });
   logFile = path.join(LOG_DIR, `shell-${modelId}.log`);
-  const banner = `[shell] ${new Date().toISOString()}\n[shell] ${model.bin}\n[shell] ${args.join(' ')}\n`;
+  // 日志要能给人看,但 Key 不该留在磁盘上明晃晃摆着。
+  // 只替换显示用的这一份,真正传给进程的 argv 不动。
+  const shown = args.map((a, i) => (i > 0 && args[i - 1] === '--api-key' ? '<已隐藏>' : a));
+  const banner = `[shell] ${new Date().toISOString()}\n[shell] ${model.bin}\n[shell] ${shown.join(' ')}\n`;
   fs.writeFileSync(logFile, banner, 'utf8');
   const out = fs.openSync(logFile, 'a');
 
@@ -121,7 +150,7 @@ async function startServer(modelId, presetKey, reasoningKey) {
     detached: true,
     stdio: ['ignore', out, out],
   });
-  current = { modelId, preset: presetKey, reasoning: reasoningKey || null, startedAt: Date.now() };
+  current = { modelId, preset: presetKey, reasoning: reasoningKey || null, lanMode: !!lanMode, startedAt: Date.now() };
 
   // 子进程已经有自己的句柄了;我们继续持有会每次启动漏一个 fd。
   try { fs.closeSync(out); } catch {}
@@ -133,7 +162,7 @@ async function startServer(modelId, presetKey, reasoningKey) {
 
   child.on('exit', (code) => {
     try { fs.appendFileSync(logFile, `[shell] 服务退出,code=${code}\n`); } catch {}
-    if (child) { child = null; current = { modelId: null, preset: null, reasoning: null, startedAt: null }; }
+    if (child) { child = null; current = { modelId: null, preset: null, reasoning: null, lanMode: false, startedAt: null }; }
     notifyRenderer();
   });
 
@@ -144,7 +173,7 @@ async function startServer(modelId, presetKey, reasoningKey) {
     throw new Error(`服务启动失败或超时。日志末尾:\n${tail}`);
   }
   try { fs.appendFileSync(logFile, '[shell] 服务就绪\n'); } catch {}
-  return { url: `${BASE}/`, modelId, preset: presetKey, reasoning: current.reasoning };
+  return { url: `${BASE}/`, modelId, preset: presetKey, reasoning: current.reasoning, lanMode: current.lanMode };
 }
 
 // ------------------------------------------------------------------ 渲染层
@@ -195,9 +224,44 @@ ipcMain.handle('catalogue', () => ({
   port: PORT,
 }));
 
-ipcMain.handle('start', async (_e, { modelId, preset, reasoning }) => {
+// ------------------------------------------------------------------ 设置 / 局域网
+
+/**
+ * 设置面板与「手机访问」面板需要的全部东西。
+ *
+ * 刻意把 API Key **明文**回传给界面:用户要把它念给/粘到手机上,
+ * 遮起来就没法用了。这是本机自己的界面,不存在"泄露给第三方"。
+ */
+ipcMain.handle('settings:get', () => {
+  const s = settings.readSettings();
+  return {
+    apiKey: s.apiKey || '',
+    lanMode: !!s.lanMode,
+    addresses: localAddresses(PORT),
+  };
+});
+
+ipcMain.handle('settings:set', (_e, patch) => {
+  const clean = {};
+  if (typeof patch?.apiKey === 'string') clean.apiKey = patch.apiKey.trim();
+  if (typeof patch?.lanMode === 'boolean') clean.lanMode = patch.lanMode;
+  settings.writeSettings(clean);
+  const s = settings.readSettings();
+  return { ok: true, apiKey: s.apiKey || '', lanMode: !!s.lanMode };
+});
+
+ipcMain.handle('settings:genkey', () => {
+  const key = settings.generateApiKey();
+  settings.writeSettings({ apiKey: key });
+  return { ok: true, apiKey: key };
+});
+
+/** 网卡可能中途插拔(开热点就会多一个),所以地址要能刷新。 */
+ipcMain.handle('net:addresses', () => localAddresses(PORT));
+
+ipcMain.handle('start', async (_e, { modelId, preset, reasoning, lanMode }) => {
   try {
-    const r = await startServer(modelId, preset, reasoning);
+    const r = await startServer(modelId, preset, reasoning, lanMode);
     return { ok: true, ...r };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -220,6 +284,7 @@ ipcMain.handle('status', async () => {
     modelName: model ? model.name : null,
     preset: current.preset,
     reasoning: current.reasoning,
+    lanMode: current.lanMode,
     ctx,
     uptimeSec: current.startedAt ? Math.floor((Date.now() - current.startedAt) / 1000) : 0,
     url: health.ok ? `${BASE}/` : null,
@@ -231,6 +296,11 @@ ipcMain.handle('logs', () => readLogTail(250));
 // ------------------------------------------------------------------ 生命周期
 
 app.whenReady().then(async () => {
+  // 设置放在 userData 下:更新外壳不会把它冲掉,也不会跟着仓库被提交。
+  // MODEL_STOVE_SETTINGS_DIR 是测试用的覆盖开关 —— 自动化测试需要一个
+  // 可写、可丢弃的位置,不能去动用户真实的 %APPDATA% 设置。
+  const settingsDir = process.env.MODEL_STOVE_SETTINGS_DIR || app.getPath('userData');
+  settings.initSettings(settingsDir);
   createWindow();
 
   // 自测开关:MODEL_STOVE_AUTOSTART="<模型id>:<预设>[:<思考强度>]" 会在启动时
@@ -238,7 +308,7 @@ app.whenReady().then(async () => {
   // 不设这个变量时完全无副作用。
   const auto = process.env.MODEL_STOVE_AUTOSTART;
   if (auto) {
-    const [modelId, preset, reasoning] = auto.split(':');
+    const [modelId, preset, reasoning, lan] = auto.split(':');
     // 等窗口加载完,免得在渲染层还不存在时就发状态变更。
     try {
       await new Promise((r) => {
@@ -249,7 +319,7 @@ app.whenReady().then(async () => {
     } catch {}
     console.log('[shell] 自测启动', modelId, preset, reasoning || '(默认思考强度)');
     try {
-      await startServer(modelId, preset, reasoning);
+      await startServer(modelId, preset, reasoning, lan === 'lan');
       console.log('[shell] 自测启动成功');
       notifyRenderer();
     } catch (e) {

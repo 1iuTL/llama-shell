@@ -4,13 +4,20 @@ const path = require('path');
 
 const MODELS_DIR = 'D:\\';
 
-// 两个 llama.cpp 构建并排放着:
-//   prism —— PrismML 的 fork,是唯一能读 PTQ1_0(三进制)权重的构建
-//   stock —— ggml-org 上游构建,读标准 Q1_0(1-bit)
+// 三个 llama.cpp 构建:
+//   fast  —— 本机从 sudoingX/llama.cpp 的 pr-ptq1-mmv 分支编出来的构建,
+//            含 PTQ1_0 专用 mat-vec 内核,针对 sm_120a。
+//            实测(三元版 64K,同参数):预填充 332 -> 769 t/s(2.31x),
+//            生成 33.5 -> 43.5 t/s(+30%)。读 PTQ1_0(三进制)。
+//   prism —— PrismML 官方预编译包,能读 PTQ1_0 但**没有那个内核**,慢。
+//            保留作为回退:万一 fast 出问题可以秒切。
+//   stock —— ggml-org 上游构建,读标准 Q1_0(1-bit)。
 // 路径写成绝对路径是有意的:这个外壳放在那棵目录树**旁边**,不在里面。
 const WORKSPACE = 'C:\\deepseek harness\\models';
+const FAST_BUILD = 'C:\\deepseek harness\\llama-cpp-mmq\\build\\bin';
 
 const BIN = {
+  fast: path.join(FAST_BUILD, 'llama-server.exe'),
   prism: path.join(WORKSPACE, 'llama-prism', 'llama-server.exe'),
   stock: path.join(WORKSPACE, 'llama-cpp', 'llama-server.exe'),
 };
@@ -71,7 +78,7 @@ const MODELS = [
     name: 'Bonsai 2 27B 三元版',
     note: 'PTQ1_0 · 5.54 GB · 质量保留 98.2%',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-PTQ1_0.gguf',
-    bin: BIN.prism,
+    bin: BIN.fast,
     defaultPreset: 'text-64k',
   },
   {
@@ -79,7 +86,7 @@ const MODELS = [
     name: '三元版 · 去审查(Heretic)',
     note: 'PTQ1_0 · 5.54 GB · 拒答率大幅降低',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Heretic-PTQ1_0.gguf',
-    bin: BIN.prism,
+    bin: BIN.fast,
     defaultPreset: 'text-64k',
   },
   {
@@ -87,7 +94,7 @@ const MODELS = [
     name: '三元版 · 去审查(Abliterated)',
     note: 'PTQ1_0 · 5.54 GB · 实测零拒答',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf',
-    bin: BIN.prism,
+    bin: BIN.fast,
     defaultPreset: 'text-64k',
   },
   {
@@ -118,8 +125,19 @@ const MODELS = [
  *
  * 只有在明确要「服务级固定档位」时才传 reasoningKey。注意服务端 flag 会盖住
  * 界面里按对话设置的档位,因为界面通常以请求参数下发,优先级低于服务端配置。
+ *
+ * lanMode 为 true 时监听 0.0.0.0,手机才能连上;同网段的人也能连。
+ * 默认只监听 127.0.0.1。手机访问的可行做法是让电脑(或手机)开热点,
+ * 这样安全边界就是热点本身,不依赖校园网是否允许设备互访。
+ *
+ * apiKey 非空时加 --api-key,所有接口都要带 Authorization: Bearer <key>。
+ *
+ * 关于 API Key 与网页界面:llama.cpp 自带的 Web UI **认识**这个 Key ——
+ * 检测到 401 会弹一个输入框,校验通过就存进浏览器 localStorage,之后免输。
+ * 所以手机只需输一次。注意 / 这个页面本身是放行的(不然连输入框都拿不到),
+ * 被挡住的是 /v1/* 与 /props 这些真正的接口。
  */
-function buildArgs(model, presetKey, port, reasoningKey) {
+function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey) {
   const preset = PRESETS[presetKey];
   if (!preset) throw new Error('未知的预设: ' + presetKey);
 
@@ -138,13 +156,21 @@ function buildArgs(model, presetKey, port, reasoningKey) {
     '--temp', '1.0',
     '--top-p', '0.95',
     '--top-k', '20',
-    '--host', '127.0.0.1',
+    '--host', lanMode ? '0.0.0.0' : '127.0.0.1',
     '--port', String(port),
   ];
 
   if (reasoning && reasoning.flag) {
     args.push('--reasoning-effort', reasoning.flag);
   }
+
+  // /slots 默认开启,会回报每个槽位正在处理的内容 —— 也就是别人能看到你的提问。
+  // 绑到网络上时关掉。
+  if (lanMode) args.push('--no-slots');
+
+  // 只在真的设了 Key 时才加。留空表示不鉴权 —— 局域网模式下等于
+  // 同网段任何人都能用,界面上必须把这件事说清楚。
+  if (apiKey) args.push('--api-key', apiKey);
 
   if (preset.vision) {
     args.push('--mmproj', MMPROJ, '--no-mmproj-offload', '--image-max-tokens', '1024');
