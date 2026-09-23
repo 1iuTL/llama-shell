@@ -22,3 +22,5 @@ Desktop.ini
 .api-push-tmp/
 .repro*-tmp/
 .repro-tmp/
+.q2-compare/
+commitmsg.tmp
