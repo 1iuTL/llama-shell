@@ -28,6 +28,14 @@ contextBridge.exposeInMainWorld('shell', {
 
   /** 查压缩代理状态(当前档位、压缩开关、上下文阈值)。代理没跑时返回 offline。 */
   proxyStatus: () => ipcRenderer.invoke('proxy:status'),
+  /** 启动代理(幂等;已经有一个在服务就直接认领)。 */
+  startProxy: () => ipcRenderer.invoke('proxy:start'),
+  /** 停止代理(只停本外壳拉起的那只)。 */
+  stopProxy: () => ipcRenderer.invoke('proxy:stop'),
+  /** 查防火墙里有没有放行规则(不需要管理员权限)。 */
+  firewallStatus: () => ipcRenderer.invoke('proxy:firewallStatus'),
+  /** 发起一次提权,把放行规则加上(会弹 UAC)。 */
+  allowFirewall: () => ipcRenderer.invoke('proxy:allowFirewall'),
   /** 切换任务档位(推理 / 写作 / 通用 / 代码)。 */
   setProfile: (key) => ipcRenderer.invoke('proxy:setProfile', key),
   /** 开关自动上下文压缩。 */

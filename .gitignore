@@ -25,4 +25,5 @@ Desktop.ini
 .q2-compare/
 commitmsg.tmp
 .cordis-tmp/
+.proxy-test-tmp/
 *.tmp

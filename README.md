@@ -258,6 +258,43 @@ you are probably using the wrong GGUF: use the PQ2_0 version of this model
 - **校园网/公共 WiFi 常常设备隔离**(AP isolation),手机和电脑互相看不见,这不是配置问题。这也是推荐热点的原因。
 - 其它方案(如 Tailscale)也能用,但要额外账号、且国内可能需要中转,不如热点直接。
 
+### 手机「卡在加载界面」:先查防火墙,不是先查服务
+
+这是本项目里最难查的一次故障,记在这里省得再走一遍。
+
+现象:手机浏览器一直转圈,页面上什么都没出来;电脑这边**完全看不出异常** ——
+服务在跑、`/health` 返回 200、二维码也画出来了。很容易误判成"手机连的不是同一个网"
+或"资源太大加载不完"。
+
+真正的原因是 **Windows 防火墙的入站规则按「配置文件」生效,而防火墙默认 `BlockInbound`**。
+这台机器在手机热点时段被判为 **Public**,实测三个程序的规则数量是:
+
+| 程序 | Public 入站规则 | 后果 |
+|---|---|---|
+| `llama-server.exe` | 6 条(TCP+UDP,任意端口) | 8091 通 |
+| `node.exe` | **0 条** | 8092 的入站 SYN 被静默丢弃 |
+| `electron.exe` | **0 条** | 外壳自己的网络访问会被弹窗/拦 |
+
+于是:手机连 `:8091` 正常,连 `:8092`(代理,档位与压缩都在那儿)**一直转圈**。
+TCP 握手被丢掉,浏览器不会报错,只会等 —— 这就是"卡在加载"。
+
+**解法**:三种任选一种,做的都是同一件事(给 `node.exe` 和 `electron.exe` 加
+Public 入站允许规则):
+
+1. Model Stove 设置面板里,「任务档位」那一栏检测到规则缺失时会自己冒出一行
+   警告,点右边的**「放行防火墙」**即可(会弹一次 UAC)。
+2. 双击 `tools\allow-lan.cmd`。
+3. 管理员 PowerShell 里跑 `tools\allow-lan.ps1`。
+
+**为什么必须提权**:添加入站规则属于系统安全边界。实测普通权限执行
+`netsh advfirewall firewall add rule` 直接返回
+`The requested operation requires elevation` —— 这不是能绕过去的 bug。
+读取规则则**不需要**管理员,所以界面可以随时自检。
+
+顺带否掉一条错误假设:曾经怀疑代理剥掉 `content-encoding` 会损坏 llama.cpp 的
+静态资源(界面是一个 8.8 MB 的 Svelte 包),用 `tools/test_assets.mjs` 逐字节
+对比过 4 个资源,**完全一致**。所以不要往那个方向查。
+
 ### 为什么必须设 API Key
 
 监听 `0.0.0.0` 之后,**同一网络下的任何人都能直接用你的模型**。默认状态下没有任何认证,对方的请求和你的请求在服务端看起来一模一样。
@@ -288,14 +325,43 @@ llama.cpp 自带的 Web UI 每次把**完整对话历史**发给 `llama-server`�
 
 ### 跑起来
 
+**不需要手动启动。** 代理由 Model Stove 托管:应用启动时自动拉起,崩溃后自动重起,
+退出时一起收掉。设置面板里的「任务档位」一栏有状态点和「启动 / 停止代理」按钮。
+
+早期版本要求手工执行 `node context-proxy.mjs`,结果"忘了启动"成了最常见的故障源
+(面板显示 `ECONNREFUSED`、二维码退回 `:8091`、档位静默失效)。现在这条路径已经堵掉。
+
+托管逻辑的几点取舍:
+
+- **用独立台账文件** `logs/running-proxy-pid.json`。和 `llama-server` 的
+  `running-pids.json` 分开,否则 `startServer()` 里的遗留进程清理会顺手把代理杀掉 ——
+  这正是要避免的互相误伤。
+- **崩溃自动重起,但有上限**:1 分钟内超过 5 次就放弃并在界面说明原因,不做无限刷屏。
+- **启动是幂等的**,而且用了一个 in-flight 闩挡住并发调用。没有它的时候,两次几乎
+  同时发生的调用会双双通过"端口空闲"检查、各起一个,输的那个因 `EADDRINUSE`
+  退出又触发自动重起 —— 日志里看着像"代理在反复崩"。这个是实测发现的。
+- **三种状态明确区分**:端口空闲 → 自己起;端口有东西且能应答 → 认领为
+  `external`(比如你手动跑的那个);端口被占但不能应答 → 明确报错,不静默失败。
+- **代理不跟服务一起停。** 它很轻,而停掉它只会让手机连到一个没有档位、没有压缩的
+  地址。服务不在时它会如实返回 502,而不是假装正常。
+
+想手工跑也可以(调试时有用):
+
 ```powershell
 # 先在 Model Stove 里点「启动」,让 llama-server 跑起来
 node context-proxy.mjs
 ```
 
-**手机该连哪个端口,二维码会自动选。** 代理在跑时它指向 `:8092`(档位与压缩都生效),代理没在跑时退回 `:8091`(直连,功能少但能用)。设置面板会同时列出两类地址,并说明两者的聊天记录是**各自独立**的 —— 浏览器按来源地址隔离存储。
+这种情况下外壳会把它认领成 `external`,界面上标注「外部启动」,并且**不会**
+去停它(停止按钮只停本外壳拉起的那只)。
+
+**手机该连哪个端口,二维码会自动选。** 代理在跑时它指向 `:8092`(档位与压缩都生效),代理没在跑时退回 `:8091`(直连,功能少但能用)。界面会分别警告这两种降级情形,并说明两者的聊天记录是**各自独立**的 —— 浏览器按来源地址隔离存储。
 
 代理监听在 `0.0.0.0`,所以手机走局域网地址能直接连上(实测两个网卡地址都返回 200)。
+
+⚠️ 但"代理在本地能应答"**不等于**"手机连得上":中间还隔着防火墙的入站规则,
+而 `node.exe` 默认一条规则都没有。详见上面「手机『卡在加载界面』」一节。
+界面把这两件事分开显示,就是为了不给出"一切正常"的错误结论。
 
 功能开关与实时状态:
 
@@ -407,6 +473,28 @@ Jinja Exception: System message must be at the beginning.
 
 新版 llama.cpp 的界面是预压缩静态资源。用 `Invoke-WebRequest` 或 `urllib` 直接抓根路径会得到 `415 gzip is not supported by this browser`。浏览器天然会发 `Accept-Encoding: gzip`,所以正常使用不受影响 —— 但你自己写健康检查时要知道这一点。
 
+### 6. 脚本的编码:.ps1 要 BOM,.cmd 要纯 ASCII
+
+这一条踩过两次,而且症状离原因很远 —— 脚本报的是**语法错误**,不是乱码警告:
+
+| 文件类型 | 解释器怎么解码 | 规则 |
+|---|---|---|
+| `.ps1` | Windows PowerShell 5.1 对**无 BOM** 的文件按 ANSI(中文系统 936)解码 | 含中文就必须**带 UTF-8 BOM** |
+| `.cmd` / `.bat` | cmd.exe 按 OEM 代码页解码,加 BOM 反而会被当成命令 | 必须**纯 ASCII** |
+
+实测后果:`tools/allow-lan.ps1` 因为无 BOM,`Read-Host '按回车键退出'` 里的引号
+被乱码打断,PowerShell 报 `Unexpected token` + `Missing closing '}'`;更早写的
+`tools/diag_phone.ps1` 同样中招,其中还有一个**未终止的字符串** —— 它从一开始就是坏的。
+
+`tools/test_shell_load.mjs` 现在会机器检查这两条(含中文的 `.ps1` 必须有 BOM 且能被
+PowerShell 解析器解析;`.cmd`/`.bat` 必须无 BOM 且纯 ASCII)。这类错误不会在别处暴露,
+所以值得自动化。
+
+顺带一个更普遍的教训:**不要用 PowerShell 去编辑含中文的文件**。管道往返会经过 ANSI
+转换,写回去就是乱码(本项目在 `context-proxy.mjs`、`push_api.mjs` 上都栽过)。
+要用 .NET 的 `[System.IO.File]::WriteAllText($p, $s, [System.Text.UTF8Encoding]::new($false))`,
+或者干脆用能明确控制编码的编辑器。
+
 ## 作者的实际配置(示例,不是默认值)
 
 下面这套是开发这个外壳时用的,**仅作参考** —— 它针对特定硬件和一小组模型,不代表通用最佳实践。换环境请以 `llama-server --help` 和你的模型卡为准。
@@ -444,15 +532,25 @@ qq-bridge.mjs        QQ 官方机器人桥接(未部署,见文件头说明)
 `tools/` 下是验证与实验脚本,跑测试不需要任何依赖:
 
 ```
-node tools/test_qr.cjs        # 二维码结构(24 项)
-node tools/decode_qr.cjs      # 二维码往返解码(版本 1-10、多块交织、中文)
-node tools/check_ui.cjs       # 界面结构:内联脚本语法、元素引用、id 唯一性
-node tools/test_profiles.mjs  # 档位是否真的改变行为(自己起停代理)
-node tools/probe_runner.mjs   # 采样参数对照实验(预热 + 重复 + 顺序轮换)
-node tools/health_check.mjs   # 服务健康检测(端口/响应/显存/日志聚集)
+node tools/test_qr.cjs          # 二维码结构(24 项)
+node tools/decode_qr.cjs        # 二维码往返解码(版本 1-10、多块交织、中文)
+node tools/check_ui.cjs         # 界面结构:内联脚本语法、元素引用、id 唯一性
+node tools/test_profiles.mjs    # 档位是否真的改变行为(自己起停代理)
+node tools/test_shell_load.mjs  # 用 electron 桩加载 main.js(语法/IPC 通道/初始化)
+node tools/test_proxy_managed.mjs # 代理托管:真实起停、幂等、防火墙自检
+node tools/test_assets.mjs      # 代理转发静态资源是否逐字节一致
+node tools/probe_runner.mjs     # 采样参数对照实验(预热 + 重复 + 顺序轮换)
+node tools/health_check.mjs     # 服务健康检测(端口/响应/显存/日志聚集)
+tools/allow-lan.cmd / .ps1      # 给 node.exe / electron.exe 加防火墙入站规则(需 UAC)
 ```
 
-后两个同时被一个动态 Cordis 插件当作工具后端使用 —— 插件不自己发 HTTP,而是起子进程跑脚本(原因见"沙箱里哪些做不了")。
+`test_shell_load.mjs` 值得说一句:Electron 应用**没法在这个沙箱里启动**(mojo IPC
+需要命名管道,会被拒绝),所以界面改动无法点开验证。退而求其次的办法是把
+`require('electron')` 拦掉换成一个桩,再把 `src/main.js` 真正 require 一遍 ——
+这样能抓到语法错误、require 路径错误、IPC 通道重名、以及模块顶层初始化抛出的异常。
+它**不能**验证渲染层交互,那部分只能靠重启外壳后手动点一遍。
+另外 `test_proxy_managed.mjs` 依赖 `MODEL_STOVE_NO_AUTO_PROXY=1`:不关掉自动启动的话,
+外壳会替测试把代理起好,测试就分不清"我起的"和"它起的",失去判别力。
 
 `check_ui.cjs` 值得单独说一句:它会把 `index.html` 里 `$('xxx')` 引用到的每个 id 都对着 HTML 核一遍,并检查 id 不重复。这类错误不会在启动时报出来,只会在点某个按钮时静默失效,所以值得机器检查。
 
@@ -465,7 +563,8 @@ node tools/health_check.mjs   # 服务健康检测(端口/响应/显存/日志�
 - 没配 electron-builder 打包,目前是源码运行
 - 模型文件缺失时只在列表里置灰,不做自动获取
 - 局域网是明文 HTTP,没有 TLS(手机端要 HTTPS 得自己套反代)
-- **档位与压缩的代理需要手动启动**,外壳不会拉起它
+- **代理能起来不等于手机连得上**:`node.exe` 默认没有防火墙入站规则,
+  需要点一次「放行防火墙」(见上文)
 - **长文本单次生成长到一万多 token 后会出现重复退化**(分段生成可规避)
 
 后两条的细节、复现方式和打算怎么做,都记在 [`TODO.md`](TODO.md) 里。

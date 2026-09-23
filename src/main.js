@@ -14,12 +14,16 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
+const net = require('net');
 
 const { MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET, buildArgs, PROXY_PORT, PROXY_BASE } = require('./config');
 const settings = require('./settings');
 
 const PORT = 8091;
 const BASE = `http://127.0.0.1:${PORT}`;
+
+const REPO_ROOT = path.join(__dirname, '..');
+const PROXY_SCRIPT = path.join(REPO_ROOT, 'context-proxy.mjs');
 
 let win = null;
 let child = null;
@@ -261,6 +265,23 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey)
     throw new Error(`服务启动失败或超时。日志末尾:\n${tail}`);
   }
   try { fs.appendFileSync(logFile, '[shell] 服务就绪\n'); } catch {}
+
+  // 局域网模式下顺手确保代理也在跑。
+  //
+  // 不做成"代理跟着服务一起停":代理很轻,而且停掉它只会让手机连到
+  // 一个没有档位/没有压缩的地址。让它活着,服务不在时它会如实返回 502。
+  if (lanMode) {
+    try {
+      const pr = await startProxy();
+      if (!pr.ok) {
+        // 代理起不来不能让整个服务启动失败 —— 8051 本身是可用的。
+        try { fs.appendFileSync(logFile, `[shell] 代理未能启动:${pr.error || '(未知)'}\n`); } catch {}
+      }
+    } catch (e) {
+      try { fs.appendFileSync(logFile, `[shell] 代理启动异常:${e.message}\n`); } catch {}
+    }
+  }
+
   return { url: `${BASE}/`, modelId, preset: presetKey, reasoning: current.reasoning, budget: current.budget, lanMode: current.lanMode };
 }
 
@@ -418,10 +439,34 @@ async function proxyRequest(method, path, body) {
 }
 
 ipcMain.handle('proxy:status', async () => {
+  // 代理进程的生命周期信息也一并带回去:界面要据此显示"启动/停止代理"
+  // 按钮,以及"防火墙可能没放行"这个提示。
   const r = await proxyRequest('GET', '/_bridge/status');
-  // 把代理端口一并带回去:界面要用它拼二维码地址。
-  // 代理没在跑时只能给默认端口,界面据此显示"离线"提示而不是拼错地址。
-  return { ...r, port: PROXY_PORT };
+  const lifecycle = {
+    managed: proxyState.managed,
+    external: proxyState.external,
+    childPid: proxyChild ? proxyChild.pid : null,
+    restarts: proxyState.restarts,
+    lastExitCode: proxyState.lastExitCode,
+    lastError: proxyState.lastError,
+    startedAt: proxyState.startedAt,
+    node: proxyNodeExe || findNodeExe(),
+  };
+  return { ...r, port: PROXY_PORT, lifecycle };
+});
+
+ipcMain.handle('proxy:start', async () => {
+  try { return await startProxy(); } catch (e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('proxy:stop', async () => {
+  try { await stopProxy(); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
+});
+
+ipcMain.handle('proxy:firewallStatus', () => firewallStatus());
+
+ipcMain.handle('proxy:allowFirewall', () => {
+  try { return launchFirewallHelper(); } catch (e) { return { ok: false, error: e.message }; }
 });
 
 ipcMain.handle('proxy:setProfile', async (_e, key) => {
@@ -436,6 +481,372 @@ ipcMain.handle('proxy:setCompression', async (_e, enabled) => {
   return r.ok ? { ok: true, ...r.data } : { ok: false, error: r.data?.error || r.raw || `HTTP ${r.status}` };
 });
 
+// ------------------------------------------------- 代理进程的托管(起停/重启/放行)
+
+/**
+ * 为什么外壳要管代理的生死。
+ *
+ * 代理原先是纯手工程序(`node context-proxy.mjs`),结果是三类故障反复出现:
+ *   1. 忘了启动 -> 界面显示"代理未启动",二维码退回 8091,档位与压缩静默失效
+ *   2. 代理崩了没人管 -> 手机连 8092 一直转圈
+ *   3. **代理起来了手机也连不上** —— 这是最隐蔽的一类:
+ *      Windows 防火墙是 BlockInbound,而入站允许规则**按配置文件生效**。
+ *      llama-server.exe 有 Public 规则、node.exe 一条都没有;当本机被判为
+ *      Public(手机热点时段就是这样)时,8091 能通、8092 被静默丢包,
+ *      浏览器表现就是"卡在加载界面"。这一步只能提权解决,所以给一个按钮。
+ *
+ * 注意代理仍然是**独立进程**,不是塞进外壳:档位要在请求层改写采样参数,
+ * 而外壳不该去碰 llama.cpp 的界面逻辑。这里只是替用户记住它的生命周期。
+ */
+let proxyChild = null;
+let proxyIntentionalStop = false;
+let proxyNodeExe = null;
+// 正在进行中的启动。见 startProxy 开头的说明:没有它,两处并发调用会各起一个。
+let proxyStartInFlight = null;
+const proxyState = {
+  // true 表示这个代理是本外壳拉起来的,因而也由本外壳负责停掉
+  managed: false,
+  // 是否有一个**非本外壳启动**的代理正在服务(例如你手动跑的)
+  external: false,
+  restarts: 0,
+  windowStart: Date.now(),
+  lastExitCode: null,
+  lastError: null,
+  startedAt: null,
+};
+
+function proxyLedgerPath() {
+  return path.join(LOG_DIR, 'running-proxy-pid.json');
+}
+
+function readProxyLedger() {
+  try {
+    const v = JSON.parse(fs.readFileSync(proxyLedgerPath(), 'utf8'));
+    return Array.isArray(v) ? v.filter((n) => Number.isInteger(n) && n > 0) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeProxyLedger(pids) {
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.writeFileSync(proxyLedgerPath(), JSON.stringify(pids), 'utf8');
+  } catch { /* 台账写不了不该阻断代理 */ }
+}
+
+/**
+ * 清掉外壳上次遗留的代理进程。
+ *
+ * 单独一份台账文件(而不是和 llama-server 共用 running-pids.json):
+ * 共用的话,startServer() 里的 killLeftoverServers() 顺手就把代理杀了 ——
+ * 那正是要避免的互相误伤。
+ */
+function killLeftoverProxy() {
+  const killed = [];
+  for (const pid of readProxyLedger()) {
+    try { process.kill(pid); killed.push(pid); } catch { /* 已经不在了 */ }
+  }
+  writeProxyLedger([]);
+  if (killed.length) console.log(`[shell] 清掉了 ${killed.length} 个上次遗留的代理进程: ${killed.join(', ')}`);
+  return killed;
+}
+
+/** 端口上是否真的有东西在监听。用来区分"代理没起"和"端口被占"。 */
+function tcpProbe(port, host = '127.0.0.1', timeoutMs = 800) {
+  return new Promise((resolve) => {
+    const s = net.connect({ port, host });
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; try { s.destroy(); } catch {} resolve(v); } };
+    s.setTimeout(timeoutMs);
+    s.on('connect', () => done(true));
+    s.on('timeout', () => done(false));
+    s.on('error', () => done(false));
+  });
+}
+
+/** 找 node.exe。代理是 .mjs,只能用 node 跑(不是 Electron 的进程内模块)。 */
+function findNodeExe() {
+  const cands = [];
+  if (process.env.MODEL_STOVE_NODE) cands.push(process.env.MODEL_STOVE_NODE);
+  const pf = process.env.ProgramFiles || 'C:\\Program Files';
+  const pf86 = process.env['ProgramFiles(x86)'] || 'C:\\Program Files (x86)';
+  const lad = process.env.LOCALAPPDATA;
+  cands.push(path.join(pf, 'nodejs', 'node.exe'));
+  cands.push(path.join(pf86, 'nodejs', 'node.exe'));
+  if (lad) cands.push(path.join(lad, 'Programs', 'nodejs', 'node.exe'));
+  if (lad) cands.push(path.join(lad, 'Programs', 'node', 'node.exe'));
+  for (const c of cands) {
+    try { if (c && fs.existsSync(c)) return c; } catch { /* 继续找 */ }
+  }
+  return null;
+}
+
+/** 跑一个外部命令并把输出收进临时文件(不用管道)。 */
+function runCapture(exe, args, timeoutMs = 20000) {
+  return new Promise((resolve) => {
+    let out;
+    try {
+      fs.mkdirSync(LOG_DIR, { recursive: true });
+      out = path.join(LOG_DIR, `_run-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.log`);
+    } catch { return resolve({ ok: false, text: '' }); }
+    let fd;
+    try { fd = fs.openSync(out, 'w'); } catch { return resolve({ ok: false, text: '' }); }
+    let p;
+    try {
+      p = spawn(exe, args, { windowsHide: true, stdio: ['ignore', fd, fd] });
+    } catch (e) {
+      try { fs.closeSync(fd); } catch {}
+      return resolve({ ok: false, text: '', error: e.message });
+    }
+    try { fs.closeSync(fd); } catch {}
+    let settled = false;
+    const finish = (r) => {
+      if (settled) return;
+      settled = true;
+      let text = '';
+      try { text = fs.readFileSync(out, 'utf8'); } catch {}
+      try { fs.unlinkSync(out); } catch {}
+      resolve({ ...r, text });
+    };
+    const t = setTimeout(() => { try { p.kill(); } catch {} ; finish({ ok: false, error: 'timeout' }); }, timeoutMs);
+    p.on('error', (e) => { clearTimeout(t); finish({ ok: false, error: e.message }); });
+    p.on('exit', (code) => { clearTimeout(t); finish({ ok: code === 0 }); });
+  });
+}
+
+/**
+ * 查防火墙里有没有我们需要的入站规则。
+ *
+ * 只看 "有没有规则",不看是否 Enabled/Port —— 用 netsh 的输出做粗判足够:
+ * 我们加的是 program 规则(不限端口),存在即意味着放行。
+ * 这个查询**不需要管理员**,所以界面可以随时自检。
+ */
+const FW_RULES = [
+  { key: 'node', name: 'Model Stove proxy (node)', program: 'C:\\Program Files\\nodejs\\node.exe' },
+  { key: 'app', name: 'Model Stove app (electron)', program: path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron.exe') },
+];
+
+async function firewallStatus() {
+  const out = {};
+  for (const r of FW_RULES) {
+    const res = await runCapture('netsh', ['advfirewall', 'firewall', 'show', 'rule', `name=${r.name}`]);
+    // netsh 在"没有匹配规则"时返回非零且输出 "No rules match";存在时输出含 "Rule Name:"
+    out[r.key] = { name: r.name, program: r.program, present: /Rule Name/i.test(res.text) };
+  }
+  return out;
+}
+
+/**
+ * 拉起代理(幂等)。已经有一个能应答的代理就直接认领,不再重复起。
+ *
+ * 三种情形必须区分开,否则界面只能说"连不上":
+ *   端口空闲            -> 自己起一个
+ *   端口有东西且能应答  -> 认领为 external(可能是你手动跑的),可用
+ *   端口有东西但不能应答-> 端口冲突,明确报错
+ *
+ * 关于 proxyStartInFlight:函数中间有 await(探端口、等就绪),所以**两次
+ * 并发调用会双双通过"端口空闲"检查**,然后各 spawn 一个 —— 后一个抢不到
+ * 8092 会 EADDRINUSE 退出,又触发自动重起,日志里看着像代理在反复崩。
+ * 实测就是这么发现的:测试脚本的显式调用和 app.whenReady() 里的自动调用
+ * 同时发生,结果第一次调用的返回值变成 already:true。
+ * 所以这里把"正在启动"这件事本身也做成可等待的。
+ */
+function startProxy() {
+  if (proxyChild) return Promise.resolve({ ok: true, already: true, managed: true });
+  if (proxyStartInFlight) return proxyStartInFlight;
+
+  proxyStartInFlight = (async () => {
+    // 先看端口上有没有现成的代理
+    if (await tcpProbe(PROXY_PORT)) {
+      const r = await proxyRequest('GET', '/_bridge/status');
+      if (r.ok) {
+        proxyState.external = true;
+        proxyState.managed = false;
+        proxyState.lastError = null;
+        return { ok: true, external: true };
+      }
+      const msg = `端口 ${PROXY_PORT} 被占用,但应答的不是代理。请先关掉占用它的程序。`;
+      proxyState.lastError = msg;
+      return { ok: false, error: msg, portBusy: true };
+    }
+
+    if (!fs.existsSync(PROXY_SCRIPT)) {
+      const msg = `找不到代理脚本:${PROXY_SCRIPT}`;
+      proxyState.lastError = msg;
+      return { ok: false, error: msg };
+    }
+
+    killLeftoverProxy();
+
+    const nodeExe = findNodeExe();
+    if (!nodeExe) {
+      const msg = '没找到 node.exe。代理是 .mjs,需要 Node.js 才能跑 —— 装上 Node 或设置 MODEL_STOVE_NODE。';
+      proxyState.lastError = msg;
+      return { ok: false, error: msg };
+    }
+    proxyNodeExe = nodeExe;
+
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    const proxyLog = path.join(LOG_DIR, 'context-proxy.log');
+    const fd = fs.openSync(proxyLog, 'a');
+    proxyIntentionalStop = false;
+
+    let p;
+    try {
+      p = spawn(nodeExe, [PROXY_SCRIPT], {
+        windowsHide: true,
+        detached: true,
+        cwd: REPO_ROOT,
+        env: { ...process.env, PROXY_PORT: String(PROXY_PORT), UPSTREAM: BASE },
+        stdio: ['ignore', fd, fd],
+      });
+    } catch (e) {
+      try { fs.closeSync(fd); } catch {}
+      proxyState.lastError = e.message;
+      return { ok: false, error: e.message };
+    }
+    try { fs.closeSync(fd); } catch {}
+    proxyChild = p;
+    proxyState.managed = true;
+    proxyState.external = false;
+    proxyState.startedAt = Date.now();
+    if (p.pid) writeProxyLedger([p.pid]);
+    try { p.unref(); } catch {}
+
+    p.on('error', (e) => {
+      proxyState.lastError = `代理启动失败:${e.message}`;
+      notifyRenderer();
+    });
+
+    p.on('exit', (code) => {
+      // 只有当前这个还是我们记着的那只时才清状态 —— 避免"新代理已起、
+      // 旧代理的 exit 事件才到"把新代理的状态抹掉。
+      proxyState.lastExitCode = code;
+      if (proxyChild === p) { proxyChild = null; proxyState.managed = false; }
+      writeProxyLedger([]);
+      notifyRenderer();
+      if (proxyIntentionalStop) return;
+
+      // 崩溃自动重起,但要防止"起不来就疯狂重起"。1 分钟内超过 5 次就放弃,
+      // 明确告诉用户去看日志,而不是无限刷屏。
+      const now = Date.now();
+      if (now - proxyState.windowStart > 60000) {
+        proxyState.windowStart = now;
+        proxyState.restarts = 0;
+      }
+      if (proxyState.restarts >= 5) {
+        proxyState.lastError = `代理反复退出(1 分钟内 ${proxyState.restarts} 次),已停止自动重启。看日志末几行找原因。`;
+        notifyRenderer();
+        return;
+      }
+      proxyState.restarts++;
+      const delay = Math.min(30000, 1000 * 2 ** (proxyState.restarts - 1));
+      console.log(`[shell] 代理退出(code=${code}),${delay}ms 后第 ${proxyState.restarts} 次重起`);
+      setTimeout(() => {
+        if (!proxyChild && !proxyIntentionalStop) startProxy().then(() => notifyRenderer()).catch(() => {});
+      }, delay);
+    });
+
+    // 等它就绪。代理启动很快(不到 1 秒),给 8 秒足够。
+    //
+    // 注意这里有竞态要绕开:p.on('exit') 里会把 proxyChild 置回 null。
+    // 如果那个 exit 先到(代理启动后立刻崩),而我们又用 "proxyChild 为空"
+    // 当作"还没起来"的判断,就会陷入等待。所以改成用 spawn 的 'spawn'
+    // 事件确认"确实启动过",同时由 exit 事件来设置 exited 标志。
+    let exited = false;
+    p.once('exit', () => { exited = true; });
+
+    const t0 = Date.now();
+    for (;;) {
+      const r = await proxyRequest('GET', '/_bridge/status');
+      if (r.ok) return { ok: true, started: true, node: nodeExe };
+      if (exited) {
+        const msg = `代理启动后立刻退出了(退出码 ${proxyState.lastExitCode})。日志末几行在 logs\\context-proxy.log。`;
+        proxyState.lastError = msg;
+        return { ok: false, error: msg, exited: true };
+      }
+      if (Date.now() - t0 > 8000) {
+        const msg = '代理启动超时(8 秒内没应答)。';
+        proxyState.lastError = msg;
+        return { ok: false, error: msg, timeout: true };
+      }
+      await sleep(400);
+    }
+  })();
+
+  // 无论成败都要放开这个闩,否则一次失败会把后续所有启动请求都堵死。
+  return proxyStartInFlight.finally(() => { proxyStartInFlight = null; });
+}
+
+/** 停掉代理。只杀本外壳拉起来的那只,以及台账里我们记过的 PID。 */
+function stopProxy() {
+  return new Promise((resolve) => {
+    proxyIntentionalStop = true;
+    proxyState.managed = false;
+    proxyState.external = false;
+    proxyState.startedAt = null;
+
+    const victims = [];
+    if (proxyChild) victims.push(proxyChild);
+    const ledger = readProxyLedger();
+    writeProxyLedger([]);
+
+    if (!victims.length && !ledger.length) { proxyChild = null; return resolve(); }
+
+    for (const pid of ledger) {
+      try { process.kill(pid); } catch { /* 已经没了 */ }
+    }
+    const p = proxyChild;
+    proxyChild = null;
+    if (!p) return resolve();
+    try { p.kill(); } catch { /* 已经没了 */ }
+    const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} ; resolve(); }, 5000);
+    p.once('exit', () => { clearTimeout(t); resolve(); });
+  });
+}
+
+/**
+ * 生成一个提权的小工具调用,让用户在 UAC 弹窗里点一次「是」就能放行。
+ *
+ * 为什么必须提权:入站规则属于系统安全边界,普通权限改不了 ——
+ * 实测 `netsh advfirewall firewall add rule` 直接返回
+ * "The requested operation requires elevation"。这不是能绕过去的 bug,
+ * 所以做成"点一下按钮 -> 弹 UAC -> 点是"，而不是让用户自己去翻控制面板。
+ *
+ * 不加 -Wait:提权出来的那个窗口会停住等用户看结果,我们不能跟着卡住 IPC。
+ * 加没加上由界面稍后调 firewallStatus 自检(查询不需要管理员)。
+ */
+function launchFirewallHelper() {
+  const script = path.join(REPO_ROOT, 'tools', 'allow-lan.ps1');
+  if (!fs.existsSync(script)) return { ok: false, error: `找不到脚本:${script}` };
+  const ps = process.env.SystemRoot
+    ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe')
+    : 'powershell.exe';
+  if (!fs.existsSync(ps)) return { ok: false, error: `找不到 PowerShell:${ps}` };
+
+  const q = (s) => `'${String(s).replace(/'/g, "''")}'`;
+  const inner = `Start-Process -FilePath ${q(ps)} -Verb RunAs -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-File',${q(script)})`;
+
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  const fwLog = path.join(LOG_DIR, 'firewall.log');
+  let fd;
+  try { fd = fs.openSync(fwLog, 'a'); } catch { return { ok: false, error: '写不了日志文件' }; }
+  fs.appendFileSync(fwLog, `\n[shell] ${new Date().toISOString()} 申请放行\n`);
+  try {
+    const p = spawn(ps, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', inner], {
+      windowsHide: true, stdio: ['ignore', fd, fd],
+    });
+    p.on('error', () => {});
+    try { p.unref(); } catch {}
+  } catch (e) {
+    try { fs.closeSync(fd); } catch {}
+    return { ok: false, error: e.message };
+  }
+  try { fs.closeSync(fd); } catch {}
+  return { ok: true, note: '已发起授权请求。请在 UAC 弹窗里点「是」,然后在弹出的窗口里看结果。' };
+}
+
 // ------------------------------------------------------------------ 生命周期
 
 app.whenReady().then(async () => {
@@ -445,6 +856,25 @@ app.whenReady().then(async () => {
   const settingsDir = process.env.MODEL_STOVE_SETTINGS_DIR || app.getPath('userData');
   settings.initSettings(settingsDir);
   createWindow();
+
+  // 上次外壳非正常退出可能留下代理进程。按台账收掉,免得它占着 8092
+  // 导致这次"端口被占用"。—— 只杀我们自己记过的 PID,不碰你手动跑的。
+  killLeftoverProxy();
+
+  // 代理默认拉起:它是"档位 + 自动压缩"的载体,没它二维码会退回 8091,
+  // 那是一个功能不全的地址。失败也不弹窗,界面上的状态点会如实显示。
+  //
+  // MODEL_STOVE_NO_AUTO_PROXY=1 关掉这一步。给自动化测试用:否则测试自己的
+  // startProxy() 和外壳的自动启动会同时发生,分不清代理到底是谁拉起来的,
+  // 测试就失去了判别力(实测踩过)。
+  if (process.env.MODEL_STOVE_NO_AUTO_PROXY === '1') {
+    console.log('[shell] 已按 MODEL_STOVE_NO_AUTO_PROXY 跳过代理自动启动');
+  } else {
+    startProxy().then((r) => {
+      if (!r.ok) console.log('[shell] 代理未启动:', r.error);
+      notifyRenderer();
+    }).catch(() => {});
+  }
 
   // 自测开关:MODEL_STOVE_AUTOSTART="<模型id>:<预设>[:<思考强度>[:<思考预算>|lan]]"
   // 会在启动时立刻拉起一个服务,用来在不点任何按钮的情况下验证
@@ -487,10 +917,20 @@ async function autoStart(modelId, preset, reasoning, fourth) {
 
 app.on('window-all-closed', async () => {
   await stopServer();
+  await stopProxy();
   app.quit();
 });
 
 // 确保子进程不会比外壳活得更久。
 app.on('before-quit', () => {
   if (child) { try { child.kill(); } catch {} }
+  if (proxyChild) { try { proxyChild.kill(); } catch {} }
 });
+
+// 仅供 tools/test_shell_load.mjs 使用:把内部函数暴露出来,
+// 让"用 electron 桩加载一遍"的测试能验证它们确实存在。
+// Electron 应用本身不读这个导出,所以没有运行时影响。
+module.exports.__test = {
+  startProxy, stopProxy, firewallStatus, launchFirewallHelper,
+  findNodeExe, killLeftoverProxy, proxyState, tcpProbe, localAddresses,
+};
