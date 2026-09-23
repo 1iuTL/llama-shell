@@ -20,7 +20,7 @@
 import http from 'node:http'
 import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { injectPanel } from './ui-inject.mjs'
+import { injectPanel, PANEL_JS, PANEL_SCRIPT_PATH } from './ui-inject.mjs'
 
 // 档位定义放在 src/profiles.js(CommonJS),这里借 createRequire 读它 ——
 // 这样界面与代理共用同一份定义,不会各自漂移。
@@ -290,6 +290,12 @@ async function pipeResponse(upstreamRes, res) {
   const ctype = String(upstreamRes.headers.get('content-type') || '')
   const isHtml = ctype.includes('text/html')
   if (isHtml && upstreamRes.body) {
+    // HTML 是我们改写过的,必须禁止缓存。
+    //
+    // 为什么:上游给的是 no-cache + ETag,而正文已经被我们改过,ETag 不再
+    // 对应实际内容。实测后果是手机上一直拿到旧版本的页面 —— 面板改了也看不到,
+    // 看起来像"改动没生效"。
+    headers['cache-control'] = 'no-store, must-revalidate'
     let html
     try {
       html = await upstreamRes.text()
@@ -332,6 +338,21 @@ function readBody(req) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // ---- 面板脚本(外链资源)----
+  //
+  // 单独一个路径而不是内联进 HTML,原因见 ui-inject.mjs 的说明:
+  // 内联脚本可能被 CSP 或某些拦截策略挡掉,而元素照旧渲染 ——
+  // 表现就是"面板在,但点不动、拖不动"。外链不受内联策略影响。
+  // 另外这里显式 no-store,免得手机上一直用缓存里的旧面板。
+  if (req.url === PANEL_SCRIPT_PATH) {
+    res.writeHead(200, {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Cache-Control': 'no-store, must-revalidate',
+    })
+    res.end(PANEL_JS)
+    return
+  }
+
   // ---- 控制接口:手机/浏览器上开关压缩 ----
   if (req.url === '/_bridge/status' || req.url === '/_bridge/config') {
     if (req.method === 'GET') {

@@ -248,17 +248,30 @@ export const PANEL_JS = `
 `
 
 /**
+ * 面板脚本的对外路径。
+ *
+ * 为什么把脚本做成**外链**而不是内联:
+ *   1. 内联脚本可能被 CSP 或某些"脚本拦截"策略挡掉,而元素照样渲染 ——
+ *      表现就是"面板在,但点不动、拖不动"。外链走独立的资源请求,不受
+ *      内联策略影响。
+ *   2. 外链可以单独设缓存头,避免手机拿到旧版本的面板脚本(内联的话它跟着
+ *      HTML 一起被缓存,更难控制)。
+ *   3. 语法/加载失败更容易定位:直接请求这个路径就能看到内容。
+ */
+export const PANEL_SCRIPT_PATH = '/_stove/panel.js'
+
+/**
  * 把面板注入到 HTML 里。
  *
  * 只用字符串拼接,不用正则改写原有内容 —— 侵入性最小,也最不容易改坏上游。
  * 注入的三种成分:
- *   - CSS 放在 </head> 之前
- *   - HTML + JS 放在 </body> 之前
+ *   - CSS 放在 </head> 之前(样式内联没问题,它不涉及执行)
+ *   - 面板 HTML + 一段**外链** script 放在 </body> 之前
  *   - </body> 不存在时退化为直接追加(上游结构变化时不至于什么都不注入)
  */
 export function injectPanel(html) {
   const head = `<style id="stove-style">${PANEL_CSS}</style>`
-  const tail = `${PANEL_HTML}<script>${PANEL_JS}</script>`
+  const tail = `${PANEL_HTML}<script src="${PANEL_SCRIPT_PATH}" defer></script>`
 
   let out = html
   if (out.includes('</head>')) out = out.replace('</head>', `${head}</head>`)

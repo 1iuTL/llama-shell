@@ -71,7 +71,7 @@ if (!up) {
 check('测试代理就绪', true)
 
 try {
-  // ---- 1. HTML 里要有面板 ----
+  // ---- 1. HTML 里要有面板,并且用外链引用脚本 ----
   const r = await fetch(`http://127.0.0.1:${PORT}/`)
   const html = await r.text()
   check('/ 返回 HTML', r.headers.get('content-type', '').includes('text/html'),
@@ -79,10 +79,39 @@ try {
   check('面板容器存在', html.includes('id="stove-panel"'))
   check('面板样式存在', html.includes('id="stove-style"'))
   check('有档位文案', html.includes('任务档位'))
-  check('面板会查询档位', html.includes('/_bridge/status'))
-  check('面板会切换档位', html.includes('/_bridge/config'))
   check('注入在 </body> 之前', html.indexOf('stove-panel') < html.lastIndexOf('</body>'))
   check('没有叠加两份', (html.match(/id="stove-panel"/g) || []).length === 1)
+
+  // ---- 脚本必须是外链,不能内联 ----
+  //
+  // 内联脚本可能被 CSP 或"脚本拦截"策略挡掉,而元素照样渲染 ——
+  // 表现就是"面板在,但点不动、拖不动"。外链走独立资源请求,
+  // 不受内联策略影响,而且能单独设缓存头、单独请求来看内容。
+  console.log('\n  --- 脚本外链 ---')
+  check('HTML 用外链引用面板脚本', html.includes('src="/_stove/panel.js"'))
+  check('HTML 里没有内联的面板脚本', !html.includes('__stovePanelLoaded'))
+
+  const sp = await fetch(`http://127.0.0.1:${PORT}/_stove/panel.js`)
+  const script = await sp.text()
+  check('/_stove/panel.js 可取', sp.status === 200, 'HTTP ' + sp.status)
+  check('脚本 content-type 正确',
+    (sp.headers.get('content-type') || '').includes('javascript'),
+    sp.headers.get('content-type') || '(无)')
+  check('脚本禁止缓存(免得手机上一直是旧面板)',
+    (sp.headers.get('cache-control') || '').includes('no-store'),
+    sp.headers.get('cache-control') || '(无)')
+  check('脚本内容完整', script.includes('__stovePanelLoaded') && script.includes('bindDrag'))
+
+  // HTML 也必须禁止缓存:正文被我们改过,上游的 ETag 不再对应实际内容
+  check('HTML 禁止缓存', (r.headers.get('cache-control') || '').includes('no-store'),
+    r.headers.get('cache-control') || '(无)')
+
+  // 后面的断言有的看 HTML(标签、样式),有的看脚本(交互实现),
+  // 所以合并成一个整体来查 —— 否则会因为"代码搬到外链文件"而误报。
+  const all = html + '\n' + script
+  console.log('\n  --- 行为接线 ---')
+  check('面板会查询档位', all.includes('/_bridge/status'))
+  check('面板会切换档位', all.includes('/_bridge/config'))
 
   // ---- 可拖动 ----
   //
@@ -90,21 +119,22 @@ try {
   // 就在输入区右下角 —— 固定在那儿会把唯一的发送入口挡住(手机上尤其致命)。
   // 所以这里钉住拖动相关的实现,免得以后重构时把它弄丢。
   console.log('\n  --- 可拖动 ---')
-  check('用 Pointer Events(鼠标与触摸一套)', html.includes('pointerdown') && html.includes('pointermove') && html.includes('pointerup'))
-  check('设了 touch-action:none(否则手机上是滚动)', html.includes('touch-action:none'))
-  check('pointercancel 也收尾(来电/手势打断)', html.includes('pointercancel'))
-  check('有拖动阈值,手抖不会误判为拖动', html.includes('dragMoved') && html.includes('< 6'))
-  check('位置记进 localStorage', html.includes('localStorage') && html.includes('stove-panel-pos'))
-  check('越界会被拉回可视区', html.includes('clamp'))
-  check('拖到上方时面板翻到按钮下面', html.includes('stove-below'))
-  check('拖过之后的那次点击不会误开合', html.includes("if (dragMoved)"))
-  check('提示文案在', html.includes('可拖动'))
+  check('用 Pointer Events(鼠标与触摸一套)', all.includes('pointerdown') && all.includes('pointermove') && all.includes('pointerup'))
+  check('设了 touch-action:none(否则手机上是滚动)', all.includes('touch-action:none'))
+  check('pointercancel 也收尾(来电/手势打断)', all.includes('pointercancel'))
+  check('有拖动阈值,手抖不会误判为拖动', all.includes('dragMoved') && all.includes('< 6'))
+  check('位置记进 localStorage', all.includes('localStorage') && all.includes('stove-panel-pos'))
+  check('越界会被拉回可视区', all.includes('clamp'))
+  check('拖到上方时面板翻到按钮下面', all.includes('stove-below'))
+  check('拖过之后的那次点击不会误开合', all.includes('if (dragMoved)'))
+  check('提示文案在', all.includes('可拖动'))
 
   // 注入之后 content-length 必须被丢掉(长度变了,不能沿用上游的值)
   check('没有沿用上游的 content-length', !r.headers.get('content-length'),
     r.headers.get('content-length') || '(已丢弃,由 Node 重新计算)')
 
   // ---- 2. 其它响应一个字节都不能变 ----
+
   const assets = ['/manifest.webmanifest', '/_app/immutable/assets/bundle.CsYLz1sd.css']
   for (const a of assets) {
     let ua = null, ub = null
