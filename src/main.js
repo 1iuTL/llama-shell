@@ -9,7 +9,7 @@
 //
 // 聊天界面本身来自 llama.cpp;这个外壳只负责管理它。
 const { app, BrowserWindow, ipcMain } = require('electron');
-const { spawn } = require('child_process');
+const { spawn, execFileSync } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
@@ -489,11 +489,15 @@ ipcMain.handle('proxy:setCompression', async (_e, enabled) => {
  * 代理原先是纯手工程序(`node context-proxy.mjs`),结果是三类故障反复出现:
  *   1. 忘了启动 -> 界面显示"代理未启动",二维码退回 8091,档位与压缩静默失效
  *   2. 代理崩了没人管 -> 手机连 8092 一直转圈
- *   3. **代理起来了手机也连不上** —— 这是最隐蔽的一类:
- *      Windows 防火墙是 BlockInbound,而入站允许规则**按配置文件生效**。
- *      llama-server.exe 有 Public 规则、node.exe 一条都没有;当本机被判为
- *      Public(手机热点时段就是这样)时,8091 能通、8092 被静默丢包,
- *      浏览器表现就是"卡在加载界面"。这一步只能提权解决,所以给一个按钮。
+ *   3. 端口进不来 -> 防火墙的入站允许规则**按配置文件生效**,而防火墙默认
+ *      BlockInbound。手机热点时段本机被判为 Public,这时能不能连进来取决于
+ *      对应程序有没有 Public 入站规则。加规则只能提权,所以给一个按钮。
+ *
+ * 这里要留一条纠错记录:我曾经断言"node.exe 一条入站规则都没有",并据此把
+ * "手机卡在加载"归因于防火墙。**那是错的** —— 它来自解析 netsh 的本地化输出
+ * (中文 Windows 上是"规则名称:"而不是 "Rule Name",永远匹配不上)。查注册表
+ * 才知道 node.exe 早有 2 条 Node.js JavaScript Runtime 规则。真正的直接原因
+ * 是服务当时根本没在监听。详见 tools/firewall-rules.ps1 的说明。
  *
  * 注意代理仍然是**独立进程**,不是塞进外壳:档位要在请求层改写采样参数,
  * 而外壳不该去碰 llama.cpp 的界面逻辑。这里只是替用户记住它的生命周期。
@@ -616,24 +620,108 @@ function runCapture(exe, args, timeoutMs = 20000) {
 }
 
 /**
- * 查防火墙里有没有我们需要的入站规则。
+ * 查防火墙里有没有放行我们需要的入站规则。
  *
- * 只看 "有没有规则",不看是否 Enabled/Port —— 用 netsh 的输出做粗判足够:
- * 我们加的是 program 规则(不限端口),存在即意味着放行。
+ * 读**注册表**,而不是解析 netsh 的输出。这不是洁癖,是踩出来的:
+ *
+ *   1. netsh 的输出是**本地化**的。中文 Windows 上字段标签是
+ *      "规则名称:"/"已启用:"/"操作:",所以任何匹配 "Rule Name" 的代码
+ *      永远不命中,会把"规则存在"误判成"不存在"。这个错误导致我一度
+ *      给出了错误的故障结论,所以判据本身必须可靠。
+ *   2. 这台机器上 netsh 的查询**自相矛盾**:`show rule name="X"` 能查到,
+ *      而 `show rule name=all` 里数不到它(实测 node.exe:按名字查到,
+ *      按 all 数到 0 行)。连个数都不能信。
+ *   3. PowerShell 的 `Get-NetFirewallRule` 在**非提权**环境下返回 0 条规则,
+ *      所以它也不能用来给界面做自检。
+ *
+ * 注册表则稳定:语言无关、非提权可读、内容就是规则的权威定义。
+ * 规则值形如 `v2.33|Action=Allow|Active=TRUE|Dir=In|App=C:\...|Name=X|`,
+ * 注意**没有 Profile 段就表示三个配置文件全适用**。
+ *
  * 这个查询**不需要管理员**,所以界面可以随时自检。
  */
-const FW_RULES = [
-  { key: 'node', name: 'Model Stove proxy (node)', program: 'C:\\Program Files\\nodejs\\node.exe' },
-  { key: 'app', name: 'Model Stove app (electron)', program: path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron.exe') },
+const FW_RULE_KEYS = [
+  'HKLM\\SYSTEM\\CurrentControlSet\\Services\\SharedAccess\\Parameters\\FirewallPolicy\\FirewallRules',
 ];
 
+/** 我们要检查的两个程序。名字只用于展示,判据是 program 路径。 */
+const FW_RULES = [
+  { key: 'node', name: 'Model Stove proxy (node)', program: 'C:\\Program Files\\nodejs\\node.exe' },
+  {
+    key: 'app',
+    name: 'Model Stove app (electron)',
+    program: path.join(REPO_ROOT, 'node_modules', 'electron', 'dist', 'electron.exe'),
+  },
+];
+
+/** 读出所有防火墙规则条目(不筛选),返回字符串数组。 */
+function readFirewallRuleValues() {
+  const out = [];
+  const tmp = path.join(LOG_DIR, `_fwrules-${process.pid}.txt`);
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+  } catch { /* 目录建不了就直接放弃 */ }
+
+  for (const key of FW_RULE_KEYS) {
+    let fd;
+    try { fd = fs.openSync(tmp, 'w'); } catch { return out; }
+    try {
+      // 必须把 stdout 接**文件**。
+      //
+      // Node 的 execFile/execFileSync 默认用管道,而受限环境里打开匿名管道
+      // 会被拒(实测 `spawnSync reg EPERM`)。所以这里显式把 fd 传进 stdio ——
+      // 这样既保住了同步语义(启动路径上的自检不该让主进程异步等待),
+      // 又不碰管道。这个仓库里所有子进程调用都是因此改成文件重定向的。
+      execFileSync('reg', ['query', key], {
+        stdio: ['ignore', fd, fd],
+        windowsHide: true,
+        timeout: 20000,
+      });
+    } catch { /* 读不到就当查不出来 */ }
+    try { fs.closeSync(fd); } catch { /* 已经关了 */ }
+
+    let text = '';
+    try { text = fs.readFileSync(tmp, 'utf8'); } catch { /* 没读到就当空 */ }
+    try { fs.unlinkSync(tmp); } catch { /* 删不掉无所谓 */ }
+
+    for (const line of text.split(/\r?\n/)) {
+      // reg query 的输出形如(`·` 表示空格):
+      //   ····{GUID}····REG_SZ····v2.33|Action=Allow|...
+      //   ····Model·Stove·proxy·(node)····REG_SZ····v2.33|...
+      //
+      // 这里有个坑:不能用 `\s{2,}` 当分隔符,因为 `\s` 包含换行符,
+      // 而 `.*?` 遇到换行就停 —— 结果是整个正则一条都匹配不上(实测解析出 0 条)。
+      // 值名和类型之间固定是 4 个空格,直接写死。
+      const m = line.match(/^\s{4}(.+?)\s{4}REG_SZ\s{4}(.*)$/);
+      if (m) out.push(m[2].trim());
+    }
+  }
+  return out;
+}
+
+/** 按需要检查的程序列表,判断每个是否已被入站放行。 */
 async function firewallStatus() {
+  const values = readFirewallRuleValues();
   const out = {};
   for (const r of FW_RULES) {
-    const res = await runCapture('netsh', ['advfirewall', 'firewall', 'show', 'rule', `name=${r.name}`]);
-    // netsh 在"没有匹配规则"时返回非零且输出 "No rules match";存在时输出含 "Rule Name:"
-    out[r.key] = { name: r.name, program: r.program, present: /Rule Name/i.test(res.text) };
+    // 只认"入站 + 允许 + 已启用"的规则 —— 这才是"能不能连进来"的判据
+    const hit = values.filter((v) => {
+      if (!v.includes(r.program)) return false;
+      const f = {};
+      for (const seg of v.split('|')) {
+        const m = seg.match(/^([A-Za-z]+)=(.*)$/);
+        if (m) f[m[1]] = m[2];
+      }
+      return f.Dir === 'In' && f.Action === 'Allow' && f.Active === 'TRUE';
+    });
+    out[r.key] = {
+      name: r.name,
+      program: r.program,
+      present: hit.length > 0,
+      count: hit.length,
+    };
   }
+  out._source = values.length ? 'registry' : 'unavailable';
   return out;
 }
 

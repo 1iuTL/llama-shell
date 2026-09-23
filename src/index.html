@@ -826,11 +826,16 @@ let PROXY = { online: false, profile: null, profiles: [], compressEnabled: null,
 /**
  * 防火墙自检结果。
  *
- * 为什么这件事要摆在界面上:手机连不上的原因里,最隐蔽的一类不是"服务没起",
- * 而是**端口进不来**。Windows 防火墙是 BlockInbound,入站允许规则按配置文件
- * 生效 —— llama-server.exe 有 Public 规则、node.exe 一条都没有。手机热点
- * 时段本机被判为 Public,于是 8091 能通、8092(代理)被静默丢包,浏览器
- * 表现就是"卡在加载界面",而电脑这边看不出任何异常。
+ * 为什么这件事要摆在界面上:手机连不上的原因里,有一类不是"服务没起",
+ * 而是**端口进不来**。Windows 防火墙默认 BlockInbound,而入站允许规则
+ * **按配置文件生效** —— 手机热点时段本机被判为 Public,这时能不能连进来
+ * 取决于对应程序有没有 Public 入站规则。浏览器表现就是"卡在加载界面",
+ * 而电脑这边看不出任何异常。
+ *
+ * 判据读**注册表**,不解析 netsh 的输出:中文 Windows 上 netsh 的字段标签是
+ * "规则名称:"而不是 "Rule Name",匹配英文永远不会命中,会把"规则存在"误判成
+ * "不存在"(我就因此给过一次错误的故障结论)。详见 src/main.js 的
+ * readFirewallRuleValues 与 tools/firewall-rules.ps1。
  *
  * 查询规则不需要管理员,所以可以随时自检;真正添加规则必须提权,只能走 UAC。
  */
@@ -862,7 +867,7 @@ function renderFwHint() {
     return;
   }
   box.classList.remove('hidden');
-  txt.textContent = '代理是用 node.exe 跑的,而防火墙里没有它的入站规则 —— 手机访问会一直被丢包(表现就是一直转圈)。点右边按钮放行,会弹一次 UAC。';
+  txt.textContent = '代理是用 node.exe 跑的,而注册表里没有它的入站允许规则 —— 手机访问可能一直被丢包(表现就是一直转圈)。点右边按钮放行,会弹一次 UAC。';
 }
 
 async function loadFirewall() {

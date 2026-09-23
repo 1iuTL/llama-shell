@@ -45,10 +45,28 @@ $report | ForEach-Object { Write-Host "  $_" }
 
 Write-Host ''
 Write-Host '=== 复核 ===' -ForegroundColor Cyan
-foreach ($n in @('Model Stove proxy (node)', 'Model Stove app (electron)')) {
-  $r = netsh advfirewall firewall show rule name="$n" 2>&1
-  $ok = ($r | Select-String 'Rule Name').Count -gt 0
-  Write-Host ("  {0,-32} {1}" -f $n, $(if ($ok) { 'OK' } else { '不存在' }))
+
+# 复核走**注册表**,而不是解析 netsh 的输出。
+#
+# 这里原来用 `netsh advfirewall firewall show rule` 再匹配 "Rule Name",
+# 而中文 Windows 上那个字段叫"规则名称:" —— 于是规则明明加成功了,复核却报
+# "不存在",反过来还让人以为加规则失败了。netsh 在这台机器上还自相矛盾:
+# `show rule name=all` 里数不到 node.exe,按名字却能查到。详见 firewall-rules.ps1。
+. (Join-Path $PSScriptRoot 'firewall-rules.ps1')
+
+foreach ($item in @(
+  @{ Label = 'Model Stove proxy (node)';   Program = 'C:\Program Files\nodejs\node.exe' },
+  @{ Label = 'Model Stove app (electron)'; Program = 'C:\deepseek harness\model-stove\node_modules\electron\dist\electron.exe' }
+)) {
+  $hits = Get-StoveInboundAllow -Needle $item.Program
+  if ($hits.Count -gt 0) {
+    Write-Host ("  [OK] {0}" -f $item.Label) -ForegroundColor Green
+    $hits | Select-Object -First 3 | ForEach-Object {
+      Write-Host ("         {0}  Dir={1} Action={2} Active={3} Profile={4}" -f $_.Name, $_.Dir, $_.Action, $_.Active, $_.Profile)
+    }
+  } else {
+    Write-Host ("  [!!] {0}  —— 没查到入站允许规则" -f $item.Label) -ForegroundColor Red
+  }
 }
 
 Write-Host ''

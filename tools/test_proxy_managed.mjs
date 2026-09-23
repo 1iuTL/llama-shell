@@ -174,6 +174,12 @@ const fw = step('firewall');
 console.log('  ' + JSON.stringify(fw));
 check('firewallStatus 跑得通', !!(fw && !fw.error), fw && fw.error ? fw.error : '');
 check('自检同时覆盖 node 与 app', !!(fw && fw.node && fw.app), fw ? Object.keys(fw).join(',') : '');
+// 判据必须是注册表:解析 netsh 的本地化文本曾在中文 Windows 上把"存在"
+// 误判成"不存在",那正是错误结论的来源。
+check('判据来自注册表', !!(fw && fw._source === 'registry'), fw ? `_source=${fw._source}` : '');
+// 这两条规则是实际加过的,注册表里查得到;查不到说明判据又坏了。
+check('node.exe 被识别为已放行', !!(fw && fw.node && fw.node.present), fw && fw.node ? `count=${fw.node.count}` : '');
+check('electron.exe 被识别为已放行', !!(fw && fw.app && fw.app.present), fw && fw.app ? `count=${fw.app.count}` : '');
 
 console.log('\n--- 台账 ---');
 const ledgerRaw = (() => { try { return fs.readFileSync(LEDGER, 'utf8'); } catch { return '(无)'; } })();

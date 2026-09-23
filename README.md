@@ -258,42 +258,77 @@ you are probably using the wrong GGUF: use the PQ2_0 version of this model
 - **校园网/公共 WiFi 常常设备隔离**(AP isolation),手机和电脑互相看不见,这不是配置问题。这也是推荐热点的原因。
 - 其它方案(如 Tailscale)也能用,但要额外账号、且国内可能需要中转,不如热点直接。
 
-### 手机「卡在加载界面」:先查防火墙,不是先查服务
+### 手机「卡在加载界面」怎么查
 
-这是本项目里最难查的一次故障,记在这里省得再走一遍。
-
-现象:手机浏览器一直转圈,页面上什么都没出来;电脑这边**完全看不出异常** ——
-服务在跑、`/health` 返回 200、二维码也画出来了。很容易误判成"手机连的不是同一个网"
+现象:手机浏览器一直转圈;而电脑这边**完全看不出异常** —— 服务在跑、
+`/health` 返回 200、二维码也画出来了。很容易误判成"手机连的不是同一个网"
 或"资源太大加载不完"。
 
-真正的原因是 **Windows 防火墙的入站规则按「配置文件」生效,而防火墙默认 `BlockInbound`**。
-这台机器在手机热点时段被判为 **Public**,实测三个程序的规则数量是:
+**按这个顺序查,别跳步:**
 
-| 程序 | Public 入站规则 | 后果 |
-|---|---|---|
-| `llama-server.exe` | 6 条(TCP+UDP,任意端口) | 8091 通 |
-| `node.exe` | **0 条** | 8092 的入站 SYN 被静默丢弃 |
-| `electron.exe` | **0 条** | 外壳自己的网络访问会被弹窗/拦 |
+1. **服务真的在运行吗?** 先看有没有进程在 `8091` / `8092` 上监听:
+   ```powershell
+   netstat -ano | Select-String ':8091|:8092'
+   ```
+   这一次真凶就是这个:两个端口都没监听,手机当然连不上。
+   教训是"不能确认存在 ≠ 不存在" —— 我一开始因为沙箱里 `tasklist` 被拒,
+   就写下过"服务是死的"这种超出证据的结论,后来发现它其实在正常应答。
 
-于是:手机连 `:8091` 正常,连 `:8092`(代理,档位与压缩都在那儿)**一直转圈**。
-TCP 握手被丢掉,浏览器不会报错,只会等 —— 这就是"卡在加载"。
+2. **代理起来了吗?** 它以前要手工启动,现在由外壳托管(见下一节)。
+   代理没在跑时二维码会退回 `:8091`,那个地址上档位与压缩都不生效 ——
+   界面会明确提示这种降级。
 
-**解法**:三种任选一种,做的都是同一件事(给 `node.exe` 和 `electron.exe` 加
-Public 入站允许规则):
+3. **端口进得来吗?** 这一步才是防火墙。Windows 防火墙默认 `BlockInbound`,
+   而且**入站允许规则按「配置文件」生效** —— 手机热点时段本机被判为 **Public**。
+   Model Stove 的「任务档位」一栏会自检并在需要时给出一键放行。
+   要加规则必须提权:实测普通权限执行 `netsh advfirewall firewall add rule`
+   直接返回 `The requested operation requires elevation`。
 
-1. Model Stove 设置面板里,「任务档位」那一栏检测到规则缺失时会自己冒出一行
-   警告,点右边的**「放行防火墙」**即可(会弹一次 UAC)。
-2. 双击 `tools\allow-lan.cmd`。
-3. 管理员 PowerShell 里跑 `tools\allow-lan.ps1`。
+**别用 `netsh` 的输出做判据。** 这是这次踩得最深的一个坑,详见下一节。
 
-**为什么必须提权**:添加入站规则属于系统安全边界。实测普通权限执行
-`netsh advfirewall firewall add rule` 直接返回
-`The requested operation requires elevation` —— 这不是能绕过去的 bug。
-读取规则则**不需要**管理员,所以界面可以随时自检。
+**顺带否掉的两条错误假设**(都验证过,不用再往这两个方向查):
 
-顺带否掉一条错误假设:曾经怀疑代理剥掉 `content-encoding` 会损坏 llama.cpp 的
-静态资源(界面是一个 8.8 MB 的 Svelte 包),用 `tools/test_assets.mjs` 逐字节
-对比过 4 个资源,**完全一致**。所以不要往那个方向查。
+- 怀疑代理剥掉 `content-encoding` 损坏了 llama.cpp 的静态资源(界面是一个
+  8.8 MB 的 Svelte 包)。用 `tools/test_assets.mjs` 逐字节对比 4 个资源,
+  **完全一致**。
+- 怀疑 `node.exe` 一条防火墙规则都没有。**这也是错的** —— 见下一节。
+
+### 坑:`netsh` 的本地化输出 + `Get-NetFirewallRule` 的权限陷阱
+
+判断"某个程序有没有被防火墙放行"看起来很简单,但三种常见做法里只有一种可靠:
+
+| 做法 | 结果 |
+|---|---|
+| 解析 `netsh advfirewall firewall show rule` 的文本 | **不可靠**,下面详述 |
+| `Get-NetFirewallRule` | **非提权时返回 0 条规则**,提权后才正常 —— 不能用于界面自检 |
+| 读注册表 `...\FirewallPolicy\FirewallRules` | **可靠**:语言无关、非提权可读 |
+
+`netsh` 的两个问题:
+
+1. **输出是本地化的。** 中文 Windows 上字段标签是 `规则名称:`/`已启用:`/`操作:`,
+   所以任何匹配 `Rule Name` 的代码**永远不命中**,会把"规则存在"误判成"不存在"。
+   我就因此得出了"`node.exe` 没有任何入站规则"的错误结论并写进了文档 ——
+   实际上它早就有 2 条 `Node.js JavaScript Runtime`(In/Allow/Public)。
+2. **它在这台机器上自相矛盾。** 同一条规则 `show rule name="X"` 能查到,
+   而 `show rule name=all` 里数不到(`node.exe`:按名字查到,按 all 数到 **0 行**;
+   注册表里其实是 **4 条**)。连个数都不能信。
+
+所以现在统一走注册表,封装在 `tools/firewall-rules.ps1`(`Get-StoveInboundAllow`),
+`src/main.js` 里也有一份等价的 Node 实现供界面自检。注册表规则值的形如:
+
+```
+v2.33|Action=Allow|Active=TRUE|Dir=In|App=C:\...\node.exe|Name=My rule|
+```
+
+两个容易读错的细节:
+
+- **没有 `Profile=` 段就表示 Domain/Private/Public 全适用**(Windows 的默认语义)。
+  别以为"字段缺了 = 没生效"。
+- 值名和类型之间固定是 **4 个空格**。用 `\s{2,}` 当分隔符会失败,因为 `\s` 包含换行,
+  `.*?` 遇到换行就停 —— 实测那个正则一条都匹配不上。
+
+`tools/test_firewall_rules.ps1` 专门测这个判据,并且会**对照打印** netsh 与注册表的
+结论差异:`netsh name=all` 说 0 条,注册表说 4 条 —— 用这条当回归证据。
 
 ### 为什么必须设 API Key
 
@@ -359,9 +394,9 @@ node context-proxy.mjs
 
 代理监听在 `0.0.0.0`,所以手机走局域网地址能直接连上(实测两个网卡地址都返回 200)。
 
-⚠️ 但"代理在本地能应答"**不等于**"手机连得上":中间还隔着防火墙的入站规则,
-而 `node.exe` 默认一条规则都没有。详见上面「手机『卡在加载界面』」一节。
+⚠️ 但"代理在本地能应答"**不等于**"手机连得上":中间还隔着防火墙的入站规则。
 界面把这两件事分开显示,就是为了不给出"一切正常"的错误结论。
+判断防火墙时**不要信 `netsh` 的文本输出**,原因见上文那一节。
 
 功能开关与实时状态:
 
@@ -542,6 +577,8 @@ node tools/test_assets.mjs      # 代理转发静态资源是否逐字节一致
 node tools/probe_runner.mjs     # 采样参数对照实验(预热 + 重复 + 顺序轮换)
 node tools/health_check.mjs     # 服务健康检测(端口/响应/显存/日志聚集)
 tools/allow-lan.cmd / .ps1      # 给 node.exe / electron.exe 加防火墙入站规则(需 UAC)
+tools/firewall-rules.ps1        # 从注册表读防火墙规则(语言无关、非提权可读)
+tools/test_firewall_rules.ps1   # 上面那个判据自己的测试(带 netsh 对照)
 ```
 
 `test_shell_load.mjs` 值得说一句:Electron 应用**没法在这个沙箱里启动**(mojo IPC
@@ -563,8 +600,8 @@ tools/allow-lan.cmd / .ps1      # 给 node.exe / electron.exe 加防火墙入站
 - 没配 electron-builder 打包,目前是源码运行
 - 模型文件缺失时只在列表里置灰,不做自动获取
 - 局域网是明文 HTTP,没有 TLS(手机端要 HTTPS 得自己套反代)
-- **代理能起来不等于手机连得上**:`node.exe` 默认没有防火墙入站规则,
-  需要点一次「放行防火墙」(见上文)
+- 手机连不上时的排查顺序:先确认服务/代理真的在监听,再查防火墙;
+  界面会自检防火墙(读注册表)并在需要时给出一键放行
 - **长文本单次生成长到一万多 token 后会出现重复退化**(分段生成可规避)
 
 后两条的细节、复现方式和打算怎么做,都记在 [`TODO.md`](TODO.md) 里。

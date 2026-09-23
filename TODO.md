@@ -21,18 +21,33 @@
 
 **动手中发现的真正根因(比"忘了启动"更隐蔽)**
 
-"手机卡在加载界面"不全是没启动代理引起的。真正的原因是 **Windows 防火墙的入站
-规则按配置文件生效**:
+首先要纠正一条我自己写下的错误结论:我曾断言"`node.exe` 一条防火墙入站规则都没有",
+并据此把"手机卡在加载"归因于防火墙。**这条是错的。** 它来自解析 `netsh` 的**本地化**
+输出 —— 中文 Windows 上字段标签是"规则名称:"而不是 `Rule Name`,所以匹配永远不命中,
+把"规则存在"读成了"不存在"。查注册表才知道 `node.exe` 早就有 2 条
+`Node.js JavaScript Runtime`(In/Allow/Public)。而且 `netsh` 在这台机器上自相矛盾:
+`show rule name="X"` 能查到,`show rule name=all` 里却数不到(注册表里其实是 4 条)。
 
-| 程序 | Public 入站规则 | 结果 |
+真正的直接原因就是最朴素的那个:**服务当时根本没在监听**(同一次诊断里
+`netstat` 显示 8091 与 8092 都是空的)。教训:"不能确认存在"不等于"不存在"。
+
+不过防火墙这条排查路径本身仍然成立,只是它是**第三步**而不是第一步:
+Windows 防火墙默认 `BlockInbound`,入站允许规则按配置文件生效(热点时段是 Public)。
+所以:
+
+| 程序 | 原有的 Public 入站规则 | 说明 |
 |---|---|---|
-| `llama-server.exe` | 6 条(TCP+UDP,任意端口) | 8091 能通 |
-| `node.exe` | **0 条** | 8092 的入站连接被静默丢弃 |
-| `electron.exe` | **0 条** | 外壳自己的网络访问会被弹窗/拦 |
+| `llama-server.exe` | 6 条 | 8091 一直能通 |
+| `node.exe` | 2 条(`Node.js JavaScript Runtime`) | 代理能通 |
+| `electron.exe` | 0 条 | 已补上 |
 
-手机热点时段本机被判为 **Public**,于是手机连 8091 正常、连 8092 一直转圈,
-而电脑这边完全看不出异常。添加规则**必须管理员权限**(实测普通权限返回
-`The requested operation requires elevation`),所以只能走一次 UAC。
+现在加规则的工具都在了,而且判据换成了**注册表**:
+
+- `tools/firewall-rules.ps1` —— 注册表读取,语言无关、非提权可读
+- `tools/test_firewall_rules.ps1` —— 判据自己的测试,并对照打印 netsh 的矛盾结论
+- `tools/allow-lan.ps1` / `.cmd` —— 提权加规则(必须提权,实测普通权限返回
+  `The requested operation requires elevation`)
+- 界面上的「放行防火墙」按钮做同一件事,并用注册表自检
 
 另外验证过一条被否定的假设:曾经怀疑代理剥掉 `content-encoding` 会损坏
 llama.cpp 的静态资源(界面是个 8.8 MB 的 Svelte 包)。用 `tools/test_assets.mjs`

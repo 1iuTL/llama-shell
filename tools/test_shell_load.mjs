@@ -148,6 +148,35 @@ for (const f of psFiles) {
   check(`${name}:语法可解析`, errs === null, errs === null ? '' : String(errs).split('\n')[0]);
 }
 
+// 有功能测试的 .ps1 也要真的跑一遍。
+// 注意执行策略在这台机器上是禁用的(Restricted),所以必须带 -ExecutionPolicy Bypass。
+const psTests = ['test_firewall_rules.ps1'];
+console.log('\n=== PowerShell 功能测试 ===');
+for (const t of psTests) {
+  const full = path.join(REPO, 'tools', t);
+  if (!fs.existsSync(full)) { check(`${t} 存在`, false); continue; }
+  const ps = path.join(process.env.SystemRoot || 'C:\\Windows',
+    'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+  const outFile = path.join(REPO, 'logs', `_pstest-${path.basename(t, '.ps1')}.log`);
+  try { fs.mkdirSync(path.dirname(outFile), { recursive: true }); } catch {}
+  let fd;
+  try { fd = fs.openSync(outFile, 'w'); } catch { check(`${t} 运行`, false, '日志打不开'); continue; }
+  try {
+    execFileSync(ps, ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', full], {
+      stdio: ['ignore', fd, fd], windowsHide: true, timeout: 120000,
+    });
+    check(`${t} 通过`, true);
+  } catch (e) {
+    check(`${t} 通过`, false, `exit=${e.status}`);
+    let txt = '';
+    try { txt = fs.readFileSync(outFile, 'utf8'); } catch {}
+    const bad = txt.split(/\r?\n/).filter((l) => l.includes('[XX]') || l.includes('失败'));
+    bad.slice(0, 5).forEach((l) => console.log('        ' + l.trim()));
+  } finally {
+    try { fs.closeSync(fd); } catch {}
+  }
+}
+
 // .cmd / .bat 走的是另一套规则:cmd.exe 按 **OEM 代码页** 解码(中文系统是 936),
 // 所以 UTF-8 中文在批处理里必然是乱码 —— 加 BOM 也救不了(BOM 会被当成命令)。
 // 唯一稳妥的做法是保持纯 ASCII。
