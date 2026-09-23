@@ -5,13 +5,21 @@ const path = require('path');
 const MODELS_DIR = 'D:\\';
 
 // 三个 llama.cpp 构建:
-//   fast  —— 本机从 sudoingX/llama.cpp 的 pr-ptq1-mmv 分支编出来的构建,
-//            含 PTQ1_0 专用 mat-vec 内核,针对 sm_120a。
-//            实测(三元版 64K,同参数):预填充 332 -> 769 t/s(2.31x),
-//            生成 33.5 -> 43.5 t/s(+30%)。读 PTQ1_0(三进制)。
-//   prism —— PrismML 官方预编译包,能读 PTQ1_0 但**没有那个内核**,慢。
-//            保留作为回退:万一 fast 出问题可以秒切。
-//   stock —— ggml-org 上游构建,读标准 Q1_0(1-bit)。
+//   fast  —— **社区** sudoingX/llama.cpp 的 pr-ptq1-mmv 分支编出来的,含 PTQ1_0
+//            专用 mat-vec 内核,实测预填充快一倍(332 -> 769 t/s)。
+//            **但这个构建不能用来跑 Bonsai 2(三值)**:同一模型文件、同一套参数,
+//            它会稳定塌缩成几百字符的连续 '/'。详见下面 prism 的说明。
+//   prism —— PrismML **官方** fork 的预编译包。Bonsai 2 必须用它。
+//            官方 README 说得很明确:Bonsai 2 需要 Hadamard 激活变换,尚未进入上游,
+//            且"每个版本只兼容特定 fork"(Q2_0 配官方 fork,Q2_0_g64 配上游)。
+//            实测对照(问题:解释反射定律,各 2 次):
+//              官方 prism × PTQ1_0   -> 2/2 正常,content 750-944 字
+//              官方 prism × Heretic  -> 2/2 正常
+//              社区 fast  × PTQ1_0   -> 0/2,最长连续重复 708 个字符
+//              社区 fast  × Heretic  -> 0/2,最长连续重复 657 个字符
+//            所以三值模型一律走 prism;曾经误用 fast,导致白查了两天"模型是不是坏的"。
+//   stock —— ggml-org 上游构建。Bonsai 1 的 Q1_0 在上游是开箱即用的
+//            (CPU/Metal/CUDA/Vulkan 全支持),所以它配 stock 最稳。
 // 路径写成绝对路径是有意的:这个外壳放在那棵目录树**旁边**,不在里面。
 const WORKSPACE = 'C:\\deepseek harness\\models';
 const FAST_BUILD = 'C:\\deepseek harness\\llama-cpp-mmq\\build\\bin';
@@ -107,21 +115,25 @@ const REASONING = {
 
 // 这里的每个模型都已经在本机下载并校验过。
 //
-// 关于 PTQ1_0 那三个:实测它们在**思考模式下会塌缩**。同一个提示词
-// ("1+1等于几")、同一套参数,reasoning 会变成 1000 多个连续的 '/'
-// 且 content 为空 —— 完全答不出。两个不同问题各复现一次,3 次试验里 1 次
-// 直接崩、两次侥幸通过。
+// 关于 PTQ1_0 那三个:它们**必须配 PrismML 官方构建**(BIN.prism)。
 //
-// 而 Q1_0 恰恰相反:3/3 正常,reasoning 有完整的分步分析(含自检),
-// 两个问题都给出正确答案,且几乎没有重复。
+// 这里曾经走过一段弯路,记录下来免得重犯:先前用 BIN.fast(社区 sudoingX fork)
+// 跑三值模型,结果稳定塌缩成几百字符的连续 '/',一度误判成"模型坏了"、
+// "三值量化不可靠"。实际上同一模型文件换成官方 prism 构建就完全正常:
 //
-// 所以**默认用 Q1_0**。这不是比特数的问题(Q1_0 位数更低反而更稳),
-// 更像是 PTQ1_0 这个较新的三值格式在该模型上实现不佳。
+//   官方 prism × PTQ1_0  -> 2/2 正常(content 750-944 字,最长重复 1)
+//   社区 fast  × PTQ1_0  -> 0/2,最长连续重复 708 个字符
+//
+// 官方 README 明确写过:Bonsai 2 需要 Hadamard 变换(尚未上游),
+// 且"每个版本只兼容特定 fork"。所以这不是模型问题,是配错了二进制。
+//
+// BIN.fast 那个内核确实快一倍,但只对**能正确工作**的模型有意义 —— 现在没有
+// 模型用它,保留仅供实验参考。
 const MODELS = [
   {
     id: 'onbit',
     name: 'Bonsai 27B 1-bit',
-    note: 'Q1_0 · 3.54 GB · 实测稳定,默认推荐',
+    note: 'Q1_0 · 3.54 GB · 最省显存,上游原生支持最稳',
     file: MODELS_DIR + 'Bonsai-27B-Q1_0.gguf',
     bin: BIN.stock,
     defaultPreset: 'text-64k',
@@ -129,29 +141,26 @@ const MODELS = [
   {
     id: 'ternary',
     name: 'Bonsai 2 27B 三元版',
-    note: 'PTQ1_0 · 5.54 GB · 思考模式不可用,须关闭思考',
+    note: 'PTQ1_0 · 5.54 GB · 质量保留 98.2%(须配官方构建)',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-PTQ1_0.gguf',
-    bin: BIN.fast,
+    bin: BIN.prism,
     defaultPreset: 'text-64k',
-    warn: '实测:思考模式下 reasoning 会塌缩成上千个连续斜杠且答不出。把思考设为「关闭」后可用,但答案尾部可能拖一段废输出。',
   },
   {
     id: 'ternary-heretic',
     name: '三元版 · 去审查(Heretic)',
-    note: 'PTQ1_0 · 5.54 GB · 思考模式不可用,须关闭思考',
+    note: 'PTQ1_0 · 5.54 GB · 拒答率大幅降低',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Heretic-PTQ1_0.gguf',
-    bin: BIN.fast,
+    bin: BIN.prism,
     defaultPreset: 'text-64k',
-    warn: '实测:默认配置下 reasoning 507 个连续斜杠、content 为空。关闭思考后能给出正确答案(尾部可能拖废输出)。',
   },
   {
     id: 'ternary-abliterated',
     name: '三元版 · 去审查(Abliterated)',
-    note: 'PTQ1_0 · 5.54 GB · 未单独复测,但同属该量化',
+    note: 'PTQ1_0 · 5.54 GB · 实测零拒答',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf',
-    bin: BIN.fast,
+    bin: BIN.prism,
     defaultPreset: 'text-64k',
-    warn: '与前两个同属 PTQ1_0,大概率同样需要关闭思考。',
   },
 ];
 
@@ -205,7 +214,10 @@ function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budget
     '-ctk', 'q4_0',
     '-ctv', 'q4_0',
     '--jinja',
-    '--temp', '1.0',
+    // 官方 model card 明确给出思考模式下的推荐采样,且实测报告的分数都基于这组值:
+    //   Temperature 0.7 / Top-p 0.95 / Top-k 20
+    // 这里原来是 temp 1.0 —— 偏高,会放大低比特模型的采样噪声。
+    '--temp', '0.7',
     '--top-p', '0.95',
     '--top-k', '20',
     '--host', lanMode ? '0.0.0.0' : '127.0.0.1',
