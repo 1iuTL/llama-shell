@@ -133,22 +133,106 @@ function localAddresses(port) {
   return out;
 }
 
+/**
+ * 找出正在监听某个端口的进程 PID。
+ *
+ * 为什么需要它:停止按钮原来只能停掉"本外壳 spawn 过的"那个子进程。可现实里
+ * 8091 上跑的可能是**别的来源**起的 llama-server(手动起的、脚本起的、
+ * 调试时起的)——这时点「停止」是空操作,界面却还显示"运行中",因为
+ * `/health` 确实能通。实测就这么留下一只占着 7.3 GB 显存的幽灵服务,
+ * 关掉软件再打开也照样"运行中"。
+ *
+ * 用 netstat 而不是 PowerShell 的 Get-NetTCPConnection:后者在非提权下会被拒。
+ * stdio 接文件 —— 这个仓库里所有子进程调用都不能用管道。
+ */
+function pidOnPort(port) {
+  const tmp = path.join(LOG_DIR, `_netstat-${process.pid}.txt`);
+  let fd;
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fd = fs.openSync(tmp, 'w');
+  } catch { return null; }
+  try {
+    execFileSync('netstat', ['-ano', '-p', 'TCP'], {
+      stdio: ['ignore', fd, fd],
+      windowsHide: true,
+      timeout: 15000,
+    });
+  } catch { /* 命令失败时按"查不到"处理 */ }
+  try { fs.closeSync(fd); } catch { /* 已关 */ }
+  let text = '';
+  try { text = fs.readFileSync(tmp, 'utf8'); } catch { /* 没读到 */ }
+  try { fs.unlinkSync(tmp); } catch { /* 删不掉无所谓 */ }
+
+  // 只认 LISTENING 那一行。TIME_WAIT 的本地地址也带端口,但 PID 是 0。
+  const re = new RegExp(`^\\s*TCP\\s+\\S+:${port}\\s+\\S+\\s+LISTENING\\s+(\\d+)\\s*$`, 'i');
+  for (const line of text.split(/\r?\n/)) {
+    const m = line.match(re);
+    if (m) return Number(m[1]);
+  }
+  return null;
+}
+
+/** 温和停掉一个进程:先 kill,8 秒不退就强杀。 */
+function killPid(pid, graceMs = 8000) {
+  return new Promise((resolve) => {
+    let dead = false;
+    const done = () => { if (!dead) { dead = true; resolve(); } };
+    try { process.kill(pid); } catch { return done(); }   // 已经没了
+    const t = setTimeout(() => {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* 已经没了 */ }
+      done();
+    }, graceMs);
+    // 轮询确认它真的走了;process.kill(pid, 0) 只是探活,不会真的发信号
+    const tick = setInterval(() => {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        clearInterval(tick);
+        clearTimeout(t);
+        done();
+      }
+    }, 250);
+  });
+}
+
 // ------------------------------------------------------------------ 进程
 
-/** 停掉当前服务。先温和 kill,8 秒不退就强杀。 */
+/**
+ * 停掉当前服务。
+ *
+ * 两个来源都要覆盖:
+ *   1. `child` —— 本外壳 spawn 的(正常路径)
+ *   2. 端口上实际监听的那个 —— 可能是外部起的(`child` 为 null 时)
+ * 少任何一个,都会出现"点了停止但服务还在跑"。
+ */
 function stopServer() {
   return new Promise((resolve) => {
-    if (!child) { current = {...EMPTY_CURRENT}; return resolve(); }
-    const dying = child;
+    const tracked = child;
     child = null;
-    // 这个进程即将退出,先把它从台账里摘掉,免得下次启动去杀一个已死的 PID。
-    writeLedger([]);
-    try {
-      dying.kill();
-    } catch { /* 已经没了 */ }
-    const done = () => { current = {...EMPTY_CURRENT}; resolve(); };
-    const t = setTimeout(() => { try { dying.kill('SIGKILL'); } catch {} ; done(); }, 8000);
-    dying.once('exit', () => { clearTimeout(t); done(); });
+    current = { ...EMPTY_CURRENT };
+
+    // 先把可能的外部监听者也找出来。注意要在动手杀之前查,否则端口一空就查不到了。
+    const adopted = tracked ? null : pidOnPort(PORT);
+
+    const pids = [];
+    if (tracked && tracked.pid) pids.push(tracked.pid);
+    if (adopted) pids.push(adopted);
+
+    // 台账只留仍然活着的;这样万一外壳中途退出,下次启动还能收掉它们。
+    writeLedger(pids);
+
+    if (!pids.length) return resolve({ stopped: [] });
+
+    if (tracked) { try { tracked.kill(); } catch { /* 已经没了 */ } }
+
+    Promise.all(pids.map((pid) => killPid(pid))).then(() => {
+      writeLedger([]);
+      if (adopted) {
+        console.log(`[shell] 停止:8091 上的监听者不是本外壳启动的,PID ${adopted} 已结束`);
+      }
+      resolve({ stopped: pids, adopted: !!adopted });
+    });
   });
 }
 
@@ -382,7 +466,10 @@ ipcMain.handle('start', async (_e, { modelId, preset, reasoning, lanMode, budget
   }
 });
 
-ipcMain.handle('stop', async () => { await stopServer(); return { ok: true }; });
+ipcMain.handle('stop', async () => {
+  const r = await stopServer();
+  return { ok: true, ...r };
+});
 
 ipcMain.handle('status', async () => {
   const health = await httpGet(`${BASE}/health`, 1500);
@@ -392,8 +479,15 @@ ipcMain.handle('status', async () => {
     try { ctx = JSON.parse(slots.body)[0]?.n_ctx ?? null; } catch {}
   }
   const model = MODELS.find((m) => m.id === current.modelId) || null;
+  // health.ok 只说明"8091 上有东西在应答",不代表它是本外壳管的。
+  // 这两件事必须分开,否则会出现"界面显示运行中,但停止按钮点不动" ——
+  // 实测就是这么留下一只占着 7.3 GB 显存的幽灵服务。
+  const managed = !!child;
   return {
     running: health.ok,
+    managed,
+    // 在跑但不是我们管的时候,如实报出来,界面才能提示"点停止会一并收掉它"
+    external: health.ok && !managed,
     modelId: current.modelId,
     modelName: model ? model.name : null,
     preset: current.preset,
@@ -460,7 +554,7 @@ ipcMain.handle('proxy:start', async () => {
 });
 
 ipcMain.handle('proxy:stop', async () => {
-  try { await stopProxy(); return { ok: true }; } catch (e) { return { ok: false, error: e.message }; }
+  try { const r = await stopProxy(); return { ok: true, ...r }; } catch (e) { return { ok: false, error: e.message }; }
 });
 
 ipcMain.handle('proxy:firewallStatus', () => firewallStatus());
@@ -879,7 +973,13 @@ function startProxy() {
   return proxyStartInFlight.finally(() => { proxyStartInFlight = null; });
 }
 
-/** 停掉代理。只杀本外壳拉起来的那只,以及台账里我们记过的 PID。 */
+/**
+ * 停掉代理。
+ *
+ * 和 stopServer 同样的道理:除了本外壳拉起的那只和台账里记过的,还要覆盖
+ * **端口上实际监听的那个** —— 否则手动起的代理(界面会认领成 external)
+ * 点「停止」也是空操作。
+ */
 function stopProxy() {
   return new Promise((resolve) => {
     proxyIntentionalStop = true;
@@ -887,22 +987,26 @@ function stopProxy() {
     proxyState.external = false;
     proxyState.startedAt = null;
 
-    const victims = [];
-    if (proxyChild) victims.push(proxyChild);
-    const ledger = readProxyLedger();
-    writeProxyLedger([]);
-
-    if (!victims.length && !ledger.length) { proxyChild = null; return resolve(); }
-
-    for (const pid of ledger) {
-      try { process.kill(pid); } catch { /* 已经没了 */ }
-    }
-    const p = proxyChild;
+    const tracked = proxyChild;
     proxyChild = null;
-    if (!p) return resolve();
-    try { p.kill(); } catch { /* 已经没了 */ }
-    const t = setTimeout(() => { try { p.kill('SIGKILL'); } catch {} ; resolve(); }, 5000);
-    p.once('exit', () => { clearTimeout(t); resolve(); });
+
+    // 杀之前先查端口(端口一空就查不到了)
+    const adopted = tracked ? null : pidOnPort(PROXY_PORT);
+
+    const pids = [];
+    if (tracked && tracked.pid) pids.push(tracked.pid);
+    for (const pid of readProxyLedger()) if (!pids.includes(pid)) pids.push(pid);
+    if (adopted && !pids.includes(adopted)) pids.push(adopted);
+
+    writeProxyLedger(pids);
+    if (!pids.length) { writeProxyLedger([]); return resolve({ stopped: [] }); }
+
+    for (const pid of pids) { try { process.kill(pid); } catch { /* 已经没了 */ } }
+
+    Promise.all(pids.map((pid) => killPid(pid, 5000))).then(() => {
+      writeProxyLedger([]);
+      resolve({ stopped: pids, adopted: !!adopted });
+    });
   });
 }
 
@@ -1033,4 +1137,8 @@ app.on('before-quit', () => {
 module.exports.__test = {
   startProxy, stopProxy, firewallStatus, launchFirewallHelper,
   findNodeExe, killLeftoverProxy, proxyState, tcpProbe, localAddresses,
+  // 停止逻辑的两个新依赖:按端口找 PID、温和杀进程。测试要直接验它们。
+  pidOnPort, killPid, stopServer,
+  // 取当前被管进程的 PID(测试用来核对按端口找到的是不是同一个)
+  proxyChildPid: () => (proxyChild ? proxyChild.pid : null),
 };

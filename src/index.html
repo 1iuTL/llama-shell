@@ -580,11 +580,22 @@ async function refresh() {
     $('btnStart').classList.toggle('attention', !SERVICE_RUNNING && !busy);
   }
   if (s.running) {
-    setDot('on', '运行中');
+    // 区分"本外壳在管"和"端口上有东西在跑"。
+    //
+    // 后者是真实出现过的状态:8091 上跑着一只别处起的 llama-server(占了
+    // 7.3 GB 显存),界面照样显示"运行中",而停止按钮按下去没反应 ——
+    // 因为那时它只肯停自己 spawn 的子进程。现在停止按钮会按端口把它收掉,
+    // 所以这里要把这件事说清楚,而不是显示成一切正常。
+    if (s.external) {
+      setDot('busy', '运行中(外部)');
+      $('barText').textContent = `8091 上有服务在跑,但不是本外壳启动的 · 点「停止」会一并收掉它`;
+    } else {
+      setDot('on', '运行中');
+      $('barText').textContent = `${s.modelName || ''} · ${s.preset || ''}` +
+        (s.reasoning ? ` · 思考:${reasonLabel(s.reasoning)}` : '');
+    }
     $('stCtx').textContent = s.ctx ? s.ctx.toLocaleString() + ' tokens' : '—';
     $('stUp').textContent = fmtUptime(s.uptimeSec);
-    $('barText').textContent = `${s.modelName || ''} · ${s.preset || ''}` +
-      (s.reasoning ? ` · 思考:${reasonLabel(s.reasoning)}` : '');
     $('btnStop').disabled = false;
     $('btnReload').disabled = false;
     $('btnOpen').disabled = false;
@@ -685,8 +696,23 @@ async function doStart() {
 }
 
 async function doStop() {
-  await window.shell.stop();
+  const b = $('btnStop');
+  b.disabled = true;
+  b.textContent = '停止中…';
+  let r = null;
+  try { r = await window.shell.stop(); } catch { /* 下面按失败处理 */ }
+  b.textContent = '停止';
+  b.disabled = false;
   await refresh();
+  // 给一句明确反馈。尤其是"停掉了外部进程"这种情况 —— 用户按停止时
+  // 未必知道 8091 上那个不是本外壳起的,不说清楚会以为是按坏了。
+  if (r && r.adopted) {
+    $('barText').textContent = `已停止 8091 上的服务(它不是本外壳启动的)`;
+  } else if (r && r.stopped && r.stopped.length) {
+    $('barText').textContent = '已停止';
+  } else if (SERVICE_RUNNING) {
+    $('barText').textContent = '停止失败:8091 上仍然有服务在应答,看日志';
+  }
 }
 
 // ------------------------------------------------------------------ 设置面板

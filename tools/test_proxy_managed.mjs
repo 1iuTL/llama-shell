@@ -69,6 +69,11 @@ const t = m.__test;
 
   log('before', { ledger: t.proxyState.managed, node: t.findNodeExe() });
 
+  // 按端口找 PID:停止按钮靠它收掉"不是本外壳启动的"服务。
+  // 这里先验证它本身:代理起来后必须能通过端口找到它。
+  log('pidOnPortBeforeStart', { pid: t.pidOnPort(${PORT}) });
+  log('pidOnPortFreePort', { pid: t.pidOnPort(59999) });
+
   // 防火墙自检:必须能在**不提权**的情况下跑通并给出结论。
   // 它决定界面上那行警告要不要出现,所以不能挂。
   let fw = null;
@@ -88,6 +93,11 @@ const t = m.__test;
 
   log('stateAfterStart', { managed: t.proxyState.managed, external: t.proxyState.external,
     pid: t.proxyState.managed ? 'child' : null });
+
+  // 起来了之后,按端口必须能找到它 —— 这是停止按钮的兜底依据
+  log('pidOnPortAfterStart', { pid: t.pidOnPort(${PORT}) });
+  // 被管进程的 PID(proxyState 里不存,从 childPid 取)
+  log('managedPid', { pid: (t.proxyChildPid ? t.proxyChildPid() : null) });
 
   // 幂等:再调一次不该起第二个
   const r2 = await t.startProxy();
@@ -115,6 +125,26 @@ const t = m.__test;
 
   await t.stopProxy();
   await new Promise((r) => setTimeout(r, 900));
+
+  // ---- 外部监听者:stopServer 必须也能收掉 ----
+  //
+  // 这是用户实际遇到的故障:8091 上跑着一只别处起的 llama-server(占 7.3 GB
+  // 显存),界面显示"运行中",而「停止」按下去没反应 —— 因为那时 stopServer
+  // 只肯停自己 spawn 的子进程。
+  //
+  // 这里用一个只做 listen 的哑进程占住 8091:它没有 /health、不是我们的子进程,
+  // 所以模拟的正是"外部监听者"。
+  const blocker = require('child_process').spawn(process.execPath, ['-e',
+    "require('http').createServer((q,s)=>s.end('x')).listen(8091,'0.0.0.0',()=>setInterval(()=>{},1000))"
+  ], { stdio: 'ignore', windowsHide: true });
+  await new Promise((r) => setTimeout(r, 1500));
+  log('blockerPid', { pid: blocker.pid });
+  log('pidOnPort8091', { pid: t.pidOnPort(8091) });
+
+  const stopResult = await t.stopServer();
+  log('stopServerResult', stopResult);
+  await new Promise((r) => setTimeout(r, 1200));
+  log('pidOnPort8091After', { pid: t.pidOnPort(8091) });
 
   // 停掉之后端口应该不再应答
   let after = null;
@@ -195,6 +225,21 @@ const again = step('startAgain');
 const after = step('afterStop');
 const state = step('stateAfterStart');
 
+// ---- 按端口找 PID ----
+//
+// 这是"停止按钮"的兜底依据:8091 上跑的可能是别处起的 llama-server,
+// 那时 child 为 null,只能靠端口把 PID 找出来才停得掉。
+console.log('\n--- 按端口找 PID ---');
+const freeBefore = step('pidOnPortBeforeStart');
+const found = step('pidOnPortAfterStart');
+const freePort = step('pidOnPortFreePort');
+const managedPid = (() => { const s = step('managedPid'); return s ? s.pid : null; })();
+check('代理未起时端口查不到 PID', !!(freeBefore && freeBefore.pid === null), JSON.stringify(freeBefore));
+check('代理起来后能按端口找到 PID', !!(found && Number.isInteger(found.pid) && found.pid > 0), JSON.stringify(found));
+check('没在监听的端口返回 null', !!(freePort && freePort.pid === null), JSON.stringify(freePort));
+check('找到的 PID 与被管进程一致', !!(found && managedPid && found.pid === managedPid),
+  `found=${found && found.pid} managed=${managedPid}`);
+
 check('startProxy 返回 ok', !!(start && start.ok), JSON.stringify(start));
 check('是"这次真的启动了一个"而不是认领现成的', !!(start && start.started && !start.already && !start.external), JSON.stringify(start));
 check('代理真的起来了(可被本外壳托管)', !!(state && state.managed));
@@ -203,6 +248,16 @@ check('/_bridge/status 含 profile/compression', !!(status && status.keys && sta
   status && status.keys ? status.keys.join(',') : '');
 check('再次调用是幂等的', !!(again && again.ok), JSON.stringify(again));
 check('停止后端口不再应答', !!(after && (after.unreachable || after.code === undefined || after.code >= 500)), JSON.stringify(after));
+
+// ---- 外部监听者也要能被停掉 ----
+console.log('\n--- 外部监听者(模拟别处起的服务)---');
+const blockerPid = (() => { const s = step('blockerPid'); return s ? s.pid : null; })();
+const onPort = step('pidOnPort8091');
+const stopRes = step('stopServerResult');
+const onPortAfter = step('pidOnPort8091After');
+check('哑进程已占住 8091', !!(onPort && onPort.pid === blockerPid), `blocker=${blockerPid} found=${onPort && onPort.pid}`);
+check('stopServer 报告停掉了它', !!(stopRes && stopRes.adopted && stopRes.stopped && stopRes.stopped.includes(blockerPid)), JSON.stringify(stopRes));
+check('8091 已释放', !!(onPortAfter && onPortAfter.pid === null), JSON.stringify(onPortAfter));
 
 // ---- 状态隔离的断言(写入动作已在补丁脚本里、stopProxy 之前完成)----
 //
