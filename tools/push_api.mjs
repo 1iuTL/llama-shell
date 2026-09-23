@@ -7,10 +7,15 @@
 //      这条网络上经常整体不可达,而 api.github.com 与 codeload.github.com 正常。
 // 所以走 REST:建 blob -> 建 tree -> 建 commit -> 更新 ref,全程只用 API。
 //
-// 已知偏差:GitHub 组装提交对象时会把正文的结尾换行规范化掉,因此生成的
-// commit sha 与本地的**必然**不同(本地用 git hash-object 验证过:git 的规范
-// 格式要求正文恰以一个 \n 结尾)。内容由 verifyTree 逐文件自检保证正确,
-// sha 差异只影响后续推送的增量效率,不影响仓库内容。
+// 已知偏差:只有**提交信息结尾换行不规范**的那些提交,SHA 会与本地不同。
+//
+// 实测 6 个提交里 5 个 SHA 完全一致;唯一不同的是我早先用 `@'...'@` 写的那条,
+// 结尾带了两个换行 —— GitHub 会把结尾换行规范化掉,那个字节差就改变了 SHA。
+// git 自身的规范格式要求正文恰以一个 \n 结尾(用 git hash-object 逐变体验证过),
+// 本脚本已按规范构造,所以只要提交信息本身规范,SHA 就能对上。
+//
+// 这不是"GitHub 必然改变 sha",而是"不规范的提交信息会被规范化"。
+// 内容另由 verifyTree 逐文件自检保证正确。
 //
 // 需要 GH_TOKEN。用法:node tools/push_api.mjs [分支]
 import { spawn } from 'node:child_process'
@@ -110,6 +115,29 @@ async function api(method, path, body, attempts = 4) {
   throw lastErr
 }
 
+// ------------------------------------------------------------------ 并发
+
+/**
+ * 限制并发数地跑一批任务。
+ *
+ * 为什么要并发:这条网络下单个 API 请求要几十秒,而串行上传十几个文件
+ * 会让一次推送超过一小时(实测十几分钟一个 blob 都没传完)。并发到 6 路
+ * 快得多,又不至于把连接打满或撞上服务端限制。
+ */
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length)
+  let next = 0
+  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    for (;;) {
+      const i = next++
+      if (i >= items.length) return
+      results[i] = await worker(items[i], i)
+    }
+  })
+  await Promise.all(runners)
+  return results
+}
+
 // ------------------------------------------------------------------ tree 构建
 
 let blobCount = 0
@@ -144,8 +172,15 @@ function cacheSet(localSha, remoteSha) {
  *   2. 如果父提交里同一路径的 tree sha 与它相同,说明这个目录没变,
  *      同样直接复用。
  * 都命中不了才逐条构建;构建时也只传本目录的直接条目,子目录递归处理。
+ *
+ * depth 用于防空转:曾经因为 ls-tree 参数写错(用 `-- src` 而不是 `commit:src`),
+ * 子目录只返回它自己那一条,于是无限递归、进程卡死十几分钟毫无输出。
+ * 现在超过 32 层直接报错,让这类问题立刻暴露而不是表现为"卡住"。
  */
-async function ensureTree(commit, relPath, remoteKnown, parentCommit) {
+async function ensureTree(commit, relPath, remoteKnown, parentCommit, depth = 0) {
+  if (depth > 32) {
+    throw new Error(`目录递归超过 32 层,疑似 ls-tree 参数有问题(当前路径: ${relPath})`)
+  }
   const localSha = await treeShaOf(commit, relPath)
   if (localSha && remoteKnown.has(localSha)) {
     reuseCount++
@@ -161,51 +196,86 @@ async function ensureTree(commit, relPath, remoteKnown, parentCommit) {
     }
   }
 
-  // 列出该目录的**直接**子项 —— 不能带 -r。
+  // 列出该目录的**直接**子项。参数形式很关键,这里踩过两次:
   //
-  // 这里踩了个反直觉的坑:`-r` 会把子目录**递归展开成其中的 blob**,
-  // 于是输出里再也看不到 tree 条目,建出来的树就丢了整层子目录
-  // (实测:根目录只剩 7 个文件,src/ 与 tools/ 全没了,而 commit sha
-  // 对不上却看不出原因)。
-  // 不带 -r 时输出正好是直接子项,且天然区分 blob 与 tree。
+  //   git ls-tree -z <commit> -- src   -> 只返回 "src" 这一个 tree 条目本身
+  //   git ls-tree -z <commit>:src      -> 返回 src 目录里的 6 个文件  <-- 要这个
+  //
+  // 用 `-- src` 的形式时,src 被当作**过滤路径**而不是"要展开的目录",
+  // 于是脚本拿到 1 个 tree 条目后又去递归它自己 —— 无限递归卡死。
+  // 之前误判成"不能带 -r",其实和 -r 无关,是参数形式的问题。
+  const spec = relPath ? `${commit}:${relPath}` : commit
   const o = `${TMP}\\ls-${(relPath || 'root').replace(/[\\/]/g, '_')}.o`
-  await run(['git', 'ls-tree', '-z', commit, '--', relPath || '.'], { stdoutFile: o })
+  await run(['git', 'ls-tree', '-z', spec], { stdoutFile: o })
   const entries = readFileSync(o, 'utf8').split('\x00').filter(Boolean)
 
+  // 先扫一遍,把子目录递归做掉、把需要上传的 blob 收集起来。
+  //
+  // 为什么不在循环里逐个 await 上传:这条网络下单个请求要几十秒,而一个提交
+  // 有十几个文件、总共五个提交 —— 串行会跑一个多小时还看不出进展(实测卡了
+  // 十几分钟一个 blob 都没传完)。收集后并发上传,快好几倍。
   const treeEntries = []
+  const pendingBlobs = []   // { name, mode, sha }
+  const seen = new Map()    // 同一提交内内容相同的 blob 只传一次
+
   for (const e of entries) {
     const tab = e.indexOf('\t')
     const [mode, type, sha] = e.slice(0, tab).split(' ')
-    // 非递归输出里,tab 之后就是相对仓库根的完整路径
-    const full = e.slice(tab + 1)
-    if (!full) continue
-    const name = relPath ? full.slice(relPath.length + 1) : full
+    // 用 <commit>:<relPath> 列目录时,路径是**相对于该目录**的
+    // (如 "config.js"),所以直接就是子项名字,不需要再切前缀。
+    const name = e.slice(tab + 1)
+    if (!name) continue
+    // 子目录的递归路径是相对仓库根的
+    const full = relPath ? `${relPath}/${name}` : name
 
     if (type === 'commit') {
       treeEntries.push({ path: name, mode: '160000', type: 'commit', sha })
       continue
     }
     if (type === 'tree') {
-      const sub = await ensureTree(commit, full, remoteKnown, parentCommit)
+      const sub = await ensureTree(commit, full, remoteKnown, parentCommit, depth + 1)
       treeEntries.push({ path: name, mode, type: 'tree', sha: sub })
       continue
     }
 
-    // blob:先查缓存;未命中再上传,然后记进缓存。
+    // blob:先查磁盘缓存(跨次运行也有效)
     const cached = cacheGet(sha)
     if (cached) {
       blobCacheHits++
       treeEntries.push({ path: name, mode, type: 'blob', sha: cached })
       continue
     }
-    const blobFile = `${TMP}\\blob.bin`
-    await run(['git', 'cat-file', 'blob', sha], { stdoutFile: blobFile })
-    const buf = readFileSync(blobFile)
-    const b = await api('POST', '/git/blobs', { content: buf.toString('base64'), encoding: 'base64' })
-    if (b.status !== 201) throw new Error(`建 blob 失败 (${name}) HTTP ${b.status}: ${b.text.slice(0, 200)}`)
-    blobCount++
-    cacheSet(sha, b.json.sha)
-    treeEntries.push({ path: name, mode, type: 'blob', sha: b.json.sha })
+    // 同一提交里相同内容只上传一次
+    if (seen.has(sha)) {
+      treeEntries.push({ path: name, mode, type: 'blob', sha: seen.get(sha) })
+      continue
+    }
+    pendingBlobs.push({ name, mode, sha })
+    treeEntries.push({ path: name, mode, type: 'blob', sha: null })   // 位置占位,稍后回填
+  }
+
+  // ── 并发上传待传的 blob ──
+  if (pendingBlobs.length) {
+    const slots = treeEntries.filter((x) => x.sha === null)
+    const results = new Array(pendingBlobs.length)
+    await mapLimit(pendingBlobs, 6, async (item, idx) => {
+      const blobFile = `${TMP}\\blob-${idx}.bin`
+      await run(['git', 'cat-file', 'blob', item.sha], { stdoutFile: blobFile })
+      const buf = readFileSync(blobFile)
+      const b = await api('POST', '/git/blobs', {
+        content: buf.toString('base64'),
+        encoding: 'base64',
+      })
+      if (b.status !== 201) throw new Error(`建 blob 失败 (${item.name}) HTTP ${b.status}: ${b.text.slice(0, 200)}`)
+      blobCount++
+      cacheSet(item.sha, b.json.sha)
+      seen.set(item.sha, b.json.sha)
+      results[idx] = b.json.sha
+    })
+    // 回填占位
+    for (let i = 0; i < slots.length; i++) {
+      slots[i].sha = seen.get(pendingBlobs[i].sha) || results[i]
+    }
   }
 
   if (!treeEntries.length) {
