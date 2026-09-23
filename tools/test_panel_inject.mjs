@@ -16,6 +16,8 @@
 import { spawn } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import vm from 'node:vm'
+import { panelScript } from '../ui-inject.mjs'
 
 const REPO = path.resolve(import.meta.dirname, '..')
 const TMP = path.join(REPO, '.panel-test')
@@ -128,6 +130,42 @@ try {
   check('拖到上方时面板翻到按钮下面', all.includes('stove-below'))
   check('拖过之后的那次点击不会误开合', all.includes('if (dragMoved)'))
   check('提示文案在', all.includes('可拖动'))
+
+  // ---- 长按防御 ----
+  //
+  // 实测:光靠 CSS 的 user-select:none 不够 —— 长按会弹出系统的文字选取/
+  // 复制菜单,pointermove 根本没机会跑,拖动完全失效。所以要几层一起上。
+  console.log('\n  --- 长按防御 ---')
+  check('user-select:none', all.includes('user-select:none'))
+  check('-webkit-touch-callout:none(iOS 长按菜单)', all.includes('-webkit-touch-callout:none'))
+  check('pointerdown 里 preventDefault', /pointerdown[\s\S]{0,600}preventDefault/.test(script))
+  check('吞掉 contextmenu', script.includes("'contextmenu'") || script.includes('"contextmenu"'))
+  check('lostpointercapture 也收尾', script.includes('lostpointercapture'))
+  check('有复位入口(拖丢了能拉回来)', all.includes('stove-reset'))
+
+  // ---- 默认位置必须在右上角 ----
+  //
+  // 右下角是 llama.cpp 的「发送 / 停止」按钮 —— 挡在那里手机上就没法发消息了。
+  console.log('\n  --- 默认位置 ---')
+  check('默认在右上角(不是右下角)', /#stove-panel\{[^}]*top:14px/.test(html) && /#stove-panel\{[^}]*right:14px/.test(html))
+  check('默认不在右下角', !/#stove-panel\{[^}]*bottom:14px/.test(html))
+  check('位置键带版本号(避免沿用旧的右下角坐标)', script.includes('stove-panel-pos-v2'))
+
+  // ---- 脚本本身要能作为"经典脚本"编译 ----
+  //
+  // 浏览器里 <script> 不带 type 就是经典脚本。用 node:vm 按经典脚本编译,
+  // 能抓出 import / 顶层 await / 重复声明这类"页面里直接整段失效"的问题 ——
+  // 而失效的表现正是这次踩的坑:面板在,但完全点不动。
+  console.log('\n  --- 脚本可编译 ---')
+  const localScript = panelScript()
+  let compileErr = null
+  try { new vm.Script(localScript, { filename: 'panel.js' }) } catch (e) { compileErr = e.message }
+  check('可作为经典脚本编译', compileErr === null, compileErr || '')
+  check('下发的脚本与源码一致', script === localScript,
+    script === localScript ? '' : `下发 ${script.length} 字节 / 源码 ${localScript.length} 字节`)
+
+  const dupKeys = (localScript.match(/var POS_KEY/g) || []).length;
+  check('POS_KEY 只声明一次', dupKeys === 1, '声明 ' + dupKeys + ' 次');
 
   // 注入之后 content-length 必须被丢掉(长度变了,不能沿用上游的值)
   check('没有沿用上游的 content-length', !r.headers.get('content-length'),
