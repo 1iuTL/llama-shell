@@ -705,13 +705,20 @@ async function firewallStatus() {
   const out = {};
   for (const r of FW_RULES) {
     // 只认"入站 + 允许 + 已启用"的规则 —— 这才是"能不能连进来"的判据
+    //
+    // ⚠️ 路径比较必须**忽略大小写**。Windows 路径本身不区分大小写,而注册表里
+    // 存的大小写并不统一 —— 实测原有的两条 Node.js 规则写的是
+    // `C:\program files\nodejs\node.exe`(小写 p),而我们的配置是
+    // `C:\Program Files\...`。用区分大小写的 includes 会把它们判成"不存在",
+    // 这正是当初"node.exe 一条规则都没有"那个错误结论的来源之一。
+    const needle = r.program.toLowerCase();
     const hit = values.filter((v) => {
-      if (!v.includes(r.program)) return false;
       const f = {};
       for (const seg of v.split('|')) {
         const m = seg.match(/^([A-Za-z]+)=(.*)$/);
         if (m) f[m[1]] = m[2];
       }
+      if (!f.App || !f.App.toLowerCase().includes(needle)) return false;
       return f.Dir === 'In' && f.Action === 'Allow' && f.Active === 'TRUE';
     });
     out[r.key] = {
@@ -719,6 +726,11 @@ async function firewallStatus() {
       program: r.program,
       present: hit.length > 0,
       count: hit.length,
+      // 把命中的规则名一并带回去:界面想说清"是靠哪条规则放行的"
+      rules: hit.map((v) => {
+        const m = v.match(/\|Name=([^|]*)/);
+        return m ? m[1] : '(未命名)';
+      }),
     };
   }
   out._source = values.length ? 'registry' : 'unavailable';

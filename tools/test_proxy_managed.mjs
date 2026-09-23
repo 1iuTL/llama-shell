@@ -8,6 +8,11 @@
 // 跑的是真实的 spawn、真实的端口、真实的 HTTP。
 //
 // 用法:node tools/test_proxy_managed.mjs
+//
+// 端口默认 8092(真实端口),但可以用 STOVE_TEST_PORT 换一个:
+// 当 Model Stove / 你手工起的代理正占着 8092 时,测试没法在真实端口上跑
+// (它需要一个空闲端口才能验证"这次真的启动了一个")。换端口不影响被测逻辑 ——
+// 托管逻辑与端口无关,而 PROXY_PORT 是通过环境变量传进去的,和实际运行一致。
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -17,7 +22,7 @@ const REPO = path.resolve(import.meta.dirname, '..');
 const LOG_DIR = path.join(REPO, 'logs');
 const LEDGER = path.join(LOG_DIR, 'running-proxy-pid.json');
 const TMP = path.join(REPO, '.proxy-test-tmp');
-const PORT = 8092;
+const PORT = Number(process.env.STOVE_TEST_PORT || 8092);
 const BASE = `http://127.0.0.1:${PORT}`;
 
 /** 端口上有没有东西在监听。 */
@@ -137,7 +142,9 @@ const p = spawn(process.execPath, [patchFile], {
   // 不关的话,app.whenReady() 里的自动 startProxy() 会和下面的显式调用
   // 同时发生,于是第一次调用拿到的是 already:true —— 看着像通过,其实
   // "我们自己起的那个代理"根本没被验证到。实测就是这么被骗过一次。
-  env: { ...process.env, MODEL_STOVE_NO_AUTO_PROXY: '1' },
+  // PROXY_PORT 也要传进去:main.js 的 config 会读它,而托管逻辑是照它
+  // 起代理、照它探端口的 —— 换端口时两边必须一致,否则测的是错的东西。
+  env: { ...process.env, MODEL_STOVE_NO_AUTO_PROXY: '1', PROXY_PORT: String(PORT) },
   stdio: ['ignore', fd, fd],
 });
 fs.closeSync(fd);

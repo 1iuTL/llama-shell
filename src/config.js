@@ -69,7 +69,12 @@ const REASONING_BUDGET_MESSAGE = null;
 // 为什么是独立进程而不塞进外壳:档位要在**请求层**改写采样参数
 // (请求级优先于服务端启动参数,已实测),而外壳不该去碰 llama.cpp 的界面逻辑。
 // 手机连它的端口,所以它也承担"手机访问"那一侧。
-const PROXY_PORT = 8092;
+//
+// PROXY_PORT 允许用环境变量覆盖,和 context-proxy.mjs 读的是同一个变量 ——
+// 这一点必须一致:外壳照这个值起代理、也照它探端口,两边不同步就会出现
+// "探到端口被占、但那个端口上其实没有代理"这种自相矛盾的状态。
+// (这是测试在非默认端口上跑时暴露出来的。)
+const PROXY_PORT = Number(process.env.PROXY_PORT || 8092);
 const PROXY_BASE = 'http://127.0.0.1:' + PROXY_PORT;
 
 const MMPROJ = 'D:\\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf';

@@ -39,6 +39,16 @@ function Add-InboundRule {
 Add-InboundRule -Name 'Model Stove proxy (node)'   -Program 'C:\Program Files\nodejs\node.exe'
 Add-InboundRule -Name 'Model Stove app (electron)' -Program 'C:\deepseek harness\model-stove\node_modules\electron\dist\electron.exe'
 
+# 顺手清掉排查过程中可能留下的临时规则。
+#
+# 为什么需要:`netsh advfirewall firewall add rule` **不做去重**,而
+# `delete rule name=X` 一次只删一条 —— 所以"加两次、删一次"会剩一条重复规则。
+# 实测就这么堆出过重复项。
+foreach ($stale in @('MS Diag (node)', '__syntax_probe__')) {
+  netsh advfirewall firewall delete rule name="$stale" 2>&1 | Out-Null
+  if ($LASTEXITCODE -eq 0) { $report += "已清理临时规则: $stale" }
+}
+
 Write-Host ''
 Write-Host '=== 结果 ===' -ForegroundColor Cyan
 $report | ForEach-Object { Write-Host "  $_" }
