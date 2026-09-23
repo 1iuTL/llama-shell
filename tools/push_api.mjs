@@ -356,24 +356,44 @@ if (remoteSha === headSha) {
   process.exit(0)
 }
 
-// 远程提交必须存在于本地对象库,否则算不出增量
-const kind = await git(['cat-file', '-t', remoteSha], 'kind')
-if (kind !== 'commit') {
-  console.error('远程提交不在本地对象库中,无法做增量推送。')
-  process.exit(1)
-}
-
-const commits = (await git(['rev-list', '--reverse', `${remoteSha}..HEAD`], 'list'))
-  .split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
-console.log(`待推送 ${commits.length} 个提交`)
-
 // 远程已有的 tree 集合,用于整棵复用。tree sha 由内容决定,所以远程提交的
 // tree 一定在远程。
 const remoteKnown = new Set()
-{
+
+// 远程 tip 是否在本地对象库里?
+//
+// 不在的情况真会发生:如果某条历史被服务端规范化过(例如提交信息结尾换行
+// 不规范,GitHub 会改写提交对象),远程的 sha 就与本地不同,而 F 本地又没有
+// 那个改写后的对象。以前这里直接报错退出,导致"明明内容一致却再也推不上去"。
+//
+// 现在改成从 API 取远程 tip 的 tree 并塞进 remoteKnown,照样能做增量:
+// 变化的只有最上面几条,下面的树按内容复用。
+const kind = await git(['cat-file', '-t', remoteSha], 'kind')
+const remoteTipLocal = kind === 'commit'
+if (remoteTipLocal) {
   const t = await git(['rev-parse', `${remoteSha}^{tree}`], 'rt')
   if (/^[0-9a-f]{40}$/.test(t)) remoteKnown.add(t)
+} else {
+  console.log('远程 tip 不在本地对象库(可能被服务端规范化过),改从 API 取它的 tree。')
+  const c = await api('GET', `/git/commits/${remoteSha}`)
+  if (c.status !== 200) {
+    console.error(`取远程提交失败 HTTP ${c.status}: ${c.text.slice(0, 200)}`)
+    process.exit(1)
+  }
+  remoteKnown.add(c.json.tree.sha)
+  console.log(`远程 tree: ${c.json.tree.sha.slice(0, 7)}`)
 }
+
+// 待推送的提交。远程 tip 不在本地时无法用 rev-list 算区间,退化为
+// "推送本地 HEAD 这一个提交"(内容仍由 verifyTree 逐文件自检保证)。
+let commits
+if (remoteTipLocal) {
+  commits = (await git(['rev-list', '--reverse', `${remoteSha}..HEAD`], 'list'))
+    .split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+} else {
+  commits = [headSha]
+}
+console.log(`待推送 ${commits.length} 个提交`)
 
 let parent = remoteSha
 for (const sha of commits) {
