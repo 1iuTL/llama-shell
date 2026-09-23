@@ -417,7 +417,12 @@ async function proxyRequest(method, path, body) {
   }
 }
 
-ipcMain.handle('proxy:status', () => proxyRequest('GET', '/_bridge/status'));
+ipcMain.handle('proxy:status', async () => {
+  const r = await proxyRequest('GET', '/_bridge/status');
+  // 把代理端口一并带回去:界面要用它拼二维码地址。
+  // 代理没在跑时只能给默认端口,界面据此显示"离线"提示而不是拼错地址。
+  return { ...r, port: PROXY_PORT };
+});
 
 ipcMain.handle('proxy:setProfile', async (_e, key) => {
   const r = await proxyRequest('POST', '/_bridge/config', { profile: key });

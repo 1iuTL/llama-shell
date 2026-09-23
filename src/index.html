@@ -722,22 +722,38 @@ function renderLan() {
     box.appendChild(row);
   });
 
-  renderQr(list[0].url);
+  // 二维码指向哪里取决于代理是否在跑:
+  //   代理在线 -> 指向代理端口,这样**任务档位与自动压缩才生效**
+  //   否则     -> 指向 llama-server 端口(功能少,但至少能用)
+  // 之前这里固定用 list[0].url(即 llama-server 端口),结果是二维码把你带到
+  // 一个档位完全不起作用的地址,而面板又显示「代理未运行」,两处互相打架。
+  const first = list[0];
+  if (PROXY.online) {
+    const proxyUrl = `http://${first.address}:${PROXY.port}/`;
+    renderQr(proxyUrl, '带档位与压缩');
+    // 把直连地址也列出来,并标明差异:两者是不同来源,聊天记录各自独立
+    const alt = document.createElement('div');
+    alt.className = 'note';
+    alt.textContent = `若要绕过代理直连模型,把地址换成 :${CATALOGUE.port} 端口即可 —— 那样不带档位与压缩,且聊天记录是另一套(浏览器按地址隔离存储)。`;
+    box.appendChild(alt);
+  } else {
+    renderQr(first.url);
+  }
 }
 
 /**
- * 把第一个地址画成二维码。
+ * 把地址画成二维码。
  *
  * 刻意**不**把 API Key 编进码里:二维码会被截图、会被别人看到,
  * 而 Key 只该由用户在手机上亲手输一次。码里只有地址。
  */
-function renderQr(url) {
+function renderQr(url, note) {
   const box = $('qrbox');
   const why = $('qrwhy');
   try {
     box.innerHTML = window.ModelStoveQR.toSvg(url, { quiet: 1 });
     box.classList.remove('hidden');
-    why.textContent = '扫码打开 · ' + url;
+    why.textContent = '扫码打开 · ' + url + (note ? '  (' + note + ')' : '');
     why.classList.remove('hidden');
   } catch (e) {
     // 地址太长或二维码模块出错时,不该把整个设置面板拖垮
@@ -830,13 +846,16 @@ async function chooseProfile(key) {
 async function loadProxyStatus() {
   const r = await window.shell.proxyStatus();
   if (!r.ok || !r.data) {
-    PROXY = { online: false, error: r.error || `HTTP ${r.status}`, profiles: [], profile: null, compressEnabled: null };
+    PROXY = { online: false, port: r.port, error: r.error || `HTTP ${r.status}`, profiles: [], profile: null, compressEnabled: null };
     renderProfiles();
+    // 代理掉线后二维码要退回直连地址,所以这里也得重画
+    renderLan();
     return;
   }
   const d = r.data;
   PROXY = {
     online: true,
+    port: r.port,
     profile: d.profile?.current || null,
     profiles: d.profile?.available || [],
     compressEnabled: d.compression?.enabled ?? null,
@@ -846,6 +865,8 @@ async function loadProxyStatus() {
     error: null,
   };
   renderProfiles();
+  // 代理上下线会改变二维码该指向哪里,所以状态一变就重画局域网面板
+  renderLan();
 }
 
 /** 按钮上短暂显示一句反馈,然后恢复原文案。 */
