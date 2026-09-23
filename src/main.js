@@ -15,7 +15,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 
-const { MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET, buildArgs } = require('./config');
+const { MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET, buildArgs, PROXY_PORT, PROXY_BASE } = require('./config');
 const settings = require('./settings');
 
 const PORT = 8091;
@@ -386,6 +386,50 @@ ipcMain.handle('status', async () => {
 });
 
 ipcMain.handle('logs', () => readLogTail(250));
+
+// ------------------------------------------------------------------ 代理(档位 / 压缩)
+
+/**
+ * 与压缩代理通信。
+ *
+ * 代理是独立进程 —— 它必须在**请求层**改写采样参数,而外壳不该去碰
+ * llama.cpp 的界面逻辑。所以这里只做一件事:代界面转发 /_bridge 的读写。
+ *
+ * 代理没起来时必须明确区分"没在跑"和"出错",否则界面只能干瞪眼。
+ */
+async function proxyRequest(method, path, body) {
+  const url = `${PROXY_BASE}${path}`;
+  try {
+    const init = { method, signal: AbortSignal.timeout(6000) };
+    if (body !== undefined) {
+      init.headers = { 'Content-Type': 'application/json' };
+      init.body = JSON.stringify(body);
+    }
+    const r = await fetch(url, init);
+    const text = await r.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch { /* 非 JSON */ }
+    return { ok: r.ok, status: r.status, data: json, raw: json ? undefined : text.slice(0, 300) };
+  } catch (e) {
+    const cause = e.cause ? (e.cause.code || e.cause.message) : e.message;
+    // 连不上就是"代理没启动",这是最常见的状态,单独标出来
+    return { ok: false, offline: true, error: cause };
+  }
+}
+
+ipcMain.handle('proxy:status', () => proxyRequest('GET', '/_bridge/status'));
+
+ipcMain.handle('proxy:setProfile', async (_e, key) => {
+  const r = await proxyRequest('POST', '/_bridge/config', { profile: key });
+  if (r.offline) return { ok: false, offline: true, error: r.error };
+  return r.ok ? { ok: true, ...r.data } : { ok: false, error: r.data?.error || r.raw || `HTTP ${r.status}` };
+});
+
+ipcMain.handle('proxy:setCompression', async (_e, enabled) => {
+  const r = await proxyRequest('POST', '/_bridge/config', { enabled: !!enabled });
+  if (r.offline) return { ok: false, offline: true, error: r.error };
+  return r.ok ? { ok: true, ...r.data } : { ok: false, error: r.data?.error || r.raw || `HTTP ${r.status}` };
+});
 
 // ------------------------------------------------------------------ 生命周期
 

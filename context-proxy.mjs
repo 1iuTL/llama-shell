@@ -19,6 +19,12 @@
 //   COMPRESS=0   启动时关闭压缩(也可用 _bridge 接口在运行时切换)
 import http from 'node:http'
 import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+
+// 档位定义放在 src/profiles.js(CommonJS),这里借 createRequire 读它 ——
+// 这样界面与代理共用同一份定义,不会各自漂移。
+const require = createRequire(import.meta.url)
+const { profiles: PROFILES, defaultProfile, resolve: resolveProfile } = require('./src/profiles.js')
 
 // ------------------------------------------------------------------ 配置
 
@@ -52,6 +58,8 @@ const state = {
   keepRecentTurns: 4,
   // 压缩后的摘要最多保留多少 token
   summaryMaxTokens: 800,
+  // 当前任务档位。见 src/profiles.js —— 它决定采样参数与是否开思考。
+  profile: process.env.PROFILE || defaultProfile,
   // 统计
   compressCount: 0,
   lastCompressAt: null,
@@ -64,6 +72,9 @@ function loadState() {
     if (typeof saved.enabled === 'boolean') state.enabled = saved.enabled
     if (typeof saved.thresholdRatio === 'number') state.thresholdRatio = saved.thresholdRatio
     if (Number.isInteger(saved.keepRecentTurns)) state.keepRecentTurns = saved.keepRecentTurns
+    if (typeof saved.profile === 'string' && PROFILES.some((p) => p.key === saved.profile)) {
+      state.profile = saved.profile
+    }
   } catch { /* 首次运行没有状态文件 */ }
 }
 function saveState() {
@@ -72,6 +83,7 @@ function saveState() {
       enabled: state.enabled,
       thresholdRatio: state.thresholdRatio,
       keepRecentTurns: state.keepRecentTurns,
+      profile: state.profile,
     }, null, 2), 'utf8')
   } catch { /* 保存失败不影响运行 */ }
 }
@@ -277,6 +289,7 @@ const server = http.createServer(async (req, res) => {
     if (req.method === 'GET') {
       let nCtx = null
       try { nCtx = await getContextSize() } catch { /* 上游可能没起来 */ }
+      const cur = resolveProfile(state.profile)
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' })
       res.end(JSON.stringify({
         compression: {
@@ -284,6 +297,14 @@ const server = http.createServer(async (req, res) => {
           thresholdRatio: state.thresholdRatio,
           keepRecentTurns: state.keepRecentTurns,
           summaryMaxTokens: state.summaryMaxTokens,
+        },
+        profile: {
+          current: state.profile,
+          label: cur.label,
+          hint: cur.hint,
+          thinking: cur.thinking,
+          params: cur.params,
+          available: PROFILES.map((p) => ({ key: p.key, label: p.label, hint: p.hint })),
         },
         context: { nCtx, triggerAt: nCtx ? Math.floor(nCtx * state.thresholdRatio) : null },
         stats: { compressCount: state.compressCount, lastCompressAt: state.lastCompressAt, lastReason: state.lastReason },
@@ -301,10 +322,24 @@ const server = http.createServer(async (req, res) => {
         if (Number.isInteger(patch.keepRecentTurns) && patch.keepRecentTurns >= 1 && patch.keepRecentTurns <= 20) {
           state.keepRecentTurns = patch.keepRecentTurns
         }
+        // 切档位:采样参数在请求层覆盖,所以这里只需要记住选择,下个请求即生效
+        if (typeof patch.profile === 'string') {
+          if (PROFILES.some((p) => p.key === patch.profile)) {
+            state.profile = patch.profile
+            const p = resolveProfile(state.profile)
+            log(`档位切换 -> ${p.label}(${p.key}):temp=${p.params.temperature} 思考=${p.thinking ? '开' : '关'}`)
+          } else {
+            res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' })
+            res.end(JSON.stringify({ ok: false, error: `未知档位: ${patch.profile}` }))
+            return
+          }
+        }
         saveState()
-        log(`配置已更新: 压缩=${state.enabled ? '开' : '关'} 阈值=${state.thresholdRatio} 保留${state.keepRecentTurns}轮`)
+        if (patch.profile === undefined) {
+          log(`配置已更新: 压缩=${state.enabled ? '开' : '关'} 阈值=${state.thresholdRatio} 保留${state.keepRecentTurns}轮`)
+        }
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' })
-        res.end(JSON.stringify({ ok: true, compression: { enabled: state.enabled, thresholdRatio: state.thresholdRatio, keepRecentTurns: state.keepRecentTurns } }))
+        res.end(JSON.stringify({ ok: true, profile: state.profile, compression: { enabled: state.enabled, thresholdRatio: state.thresholdRatio, keepRecentTurns: state.keepRecentTurns } }))
       } catch (e) {
         res.writeHead(400, { 'Content-Type': 'application/json' })
         res.end(JSON.stringify({ ok: false, error: e.message }))
@@ -328,6 +363,30 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
+    // ---- 1. 应用任务档位 ----
+    //
+    // 必须在这里覆盖,因为请求级采样参数优先于服务端启动参数(已实测)。
+    // 界面上那个按对话的设置控件也会带参数,同样被这里盖住 —— 这是有意的:
+    // 档位的意义就是"我说了算",否则界面上随手一改就废了档位。
+    try {
+      const p = resolveProfile(state.profile)
+      Object.assign(body, p.params)
+      // 思考开关走模板参数。开思考时顺便给个预算上限,免得又出现
+      // "思考吃光整个输出预算、正文为空"的情况。
+      body.chat_template_kwargs = {
+        ...(body.chat_template_kwargs || {}),
+        enable_thinking: p.thinking,
+      }
+      if (p.thinking && body.reasoning_budget === undefined) {
+        body.reasoning_budget = 4096
+      } else if (!p.thinking) {
+        body.reasoning_budget = 0
+      }
+    } catch (e) {
+      log(`应用档位失败(${e.message}),按原请求转发`)
+    }
+
+    // ---- 2. 按需压缩历史 ----
     if (Array.isArray(body.messages)) {
       try {
         const r = await maybeCompress(body.messages)

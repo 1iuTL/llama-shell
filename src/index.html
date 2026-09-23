@@ -265,6 +265,22 @@
       </div>
 
       <div class="sec">
+        <div class="h">任务档位
+          <span class="spacer"></span>
+          <span id="proxyDot" class="dot"></span>
+        </div>
+        <div id="profileList"></div>
+        <div id="profileNote" class="note"></div>
+        <label class="opt" style="padding:4px 0">
+          <input type="checkbox" id="optCompress" />
+          <span class="txt">
+            <b>自动压缩上下文</b>
+            <span>历史接近上限时,把较早的对话总结成一段。长对话才需要。</span>
+          </span>
+        </label>
+      </div>
+
+      <div class="sec">
         <label class="opt" style="padding:4px 0">
           <input type="checkbox" id="optReasoning" />
           <span class="txt">
@@ -743,6 +759,95 @@ async function refreshNet() {
   renderLan();
 }
 
+// ------------------------------------------------------ 任务档位 / 压缩代理
+
+/**
+ * 代理状态。代理是独立进程,没启动时下面所有操作都不可用 ——
+ * 所以必须区分"没在跑"和"出错了",否则用户只会看到按钮没反应。
+ */
+let PROXY = { online: false, profile: null, profiles: [], compressEnabled: null, error: null };
+
+/**
+ * 画档位选择列表。
+ *
+ * 档位之所以必要:同一套采样参数不可能同时适合推理和创作。实测里「推理」档
+ * 写小说会**输出为空** —— 开思考后整个 token 预算被思考吃光。所以这不是
+ * "调优",而是避免用错档。
+ */
+function renderProfiles() {
+  const box = $('profileList');
+  const dot = $('proxyDot');
+  const note = $('profileNote');
+  box.innerHTML = '';
+
+  if (!PROXY.online) {
+    dot.className = 'dot err';
+    note.textContent = '档位代理没在运行。先在命令行执行 node context-proxy.mjs,档位与自动压缩才可用。';
+    const b = document.createElement('div');
+    b.className = 'warn';
+    b.textContent = PROXY.error ? ('连不上代理:' + PROXY.error) : '代理未启动';
+    box.appendChild(b);
+    $('optCompress').disabled = true;
+    return;
+  }
+
+  dot.className = 'dot on';
+  $('optCompress').disabled = false;
+  $('optCompress').checked = !!PROXY.compressEnabled;
+
+  for (const p of PROXY.profiles) {
+    const el = document.createElement('button');
+    el.className = 'item' + (p.key === PROXY.profile ? ' sel' : '');
+    const t = document.createElement('div');
+    t.className = 't';
+    t.textContent = p.label;
+    const d = document.createElement('div');
+    d.className = 'd';
+    d.textContent = p.hint;
+    el.appendChild(t);
+    el.appendChild(d);
+    el.onclick = () => chooseProfile(p.key);
+    box.appendChild(el);
+  }
+
+  note.textContent = PROXY.profileDetail || '';
+}
+
+async function chooseProfile(key) {
+  const r = await window.shell.setProfile(key);
+  if (!r.ok) {
+    $('profileNote').textContent = '切换失败:' + (r.error || '未知错误');
+    return;
+  }
+  PROXY.profile = r.profile;
+  await loadProxyStatus();
+}
+
+/**
+ * 拉取代理状态。档位在请求层覆盖采样参数,所以这里只显示"当前档位",
+ * 不显示具体数值 —— 具体值由代理在每次请求时套用。
+ */
+async function loadProxyStatus() {
+  const r = await window.shell.proxyStatus();
+  if (!r.ok || !r.data) {
+    PROXY = { online: false, error: r.error || `HTTP ${r.status}`, profiles: [], profile: null, compressEnabled: null };
+    renderProfiles();
+    return;
+  }
+  const d = r.data;
+  PROXY = {
+    online: true,
+    profile: d.profile?.current || null,
+    profiles: d.profile?.available || [],
+    compressEnabled: d.compression?.enabled ?? null,
+    profileDetail: d.profile
+      ? `${d.profile.label} · 思考${d.profile.thinking ? '开' : '关'} · 温度 ${d.profile.params?.temperature}`
+      : '',
+    error: null,
+  };
+  renderProfiles();
+}
+
 /** 按钮上短暂显示一句反馈,然后恢复原文案。 */
 function flash(id, text) {
   const b = $(id);
@@ -820,6 +925,23 @@ async function showLogs() {
     await refreshNet();
     flash('btnRefreshNet', '已刷新');
   };
+
+  // ---- 自动上下文压缩开关 ----
+  // 它控制的是代理里的行为,不是外壳自己的设置,所以改完要查一下是否真的生效,
+  // 而不是只改本地状态就算完 —— 代理可能已经退出,那样开关其实没写进去。
+  $('optCompress').onchange = async (e) => {
+    const want = e.target.checked;
+    const r = await window.shell.setCompression(want);
+    if (!r.ok) {
+      // 写失败就把勾选框恢复原状,别让它显示一个没生效的状态
+      e.target.checked = !want;
+      $('profileNote').textContent = '设置失败:' + (r.offline ? '代理未在运行' : (r.error || '未知错误'));
+      return;
+    }
+    PROXY.compressEnabled = want;
+    $('profileNote').textContent = want ? '自动压缩已开启' : '自动压缩已关闭';
+  };
+
   $('btnReload').onclick = () => { $('frame').reload(); };
   $('btnOpen').onclick = async () => {
     const s = await window.shell.status();
@@ -835,6 +957,10 @@ async function showLogs() {
   initFrameDiagnostics();
   // 只轮询侧栏状态,这里不碰 webview。
   setInterval(refresh, 4000);
+
+  // 代理是独立进程:可能先于/后于外壳启动。定期重查它的在线状态,
+  // 这样你启动了代理,面板不用刷新页面就能亮起来。
+  setInterval(loadProxyStatus, 15000);
 })();
 </script>
 </body>

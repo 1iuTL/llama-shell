@@ -64,6 +64,14 @@ const DEFAULT_REASONING_BUDGET = '32768';
 // 把整轮输出废掉。
 const REASONING_BUDGET_MESSAGE = null;
 
+// 上下文压缩 / 任务档位代理的地址。
+//
+// 为什么是独立进程而不塞进外壳:档位要在**请求层**改写采样参数
+// (请求级优先于服务端启动参数,已实测),而外壳不该去碰 llama.cpp 的界面逻辑。
+// 手机连它的端口,所以它也承担"手机访问"那一侧。
+const PROXY_PORT = 8092;
+const PROXY_BASE = 'http://127.0.0.1:' + PROXY_PORT;
+
 const MMPROJ = 'D:\\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf';
 
 // 视觉能力会多占约 0.9 GiB(投影器放内存)外加图片 token,
@@ -267,4 +275,5 @@ function resolveBudget(key) {
 module.exports = {
   MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET,
   BIN, MMPROJ, MODELS_DIR, buildArgs, resolveBudget,
+  PROXY_PORT, PROXY_BASE,
 };

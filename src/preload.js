@@ -26,6 +26,13 @@ contextBridge.exposeInMainWorld('shell', {
   /** 重新枚举网卡地址(开热点后需要刷新)。 */
   addresses: () => ipcRenderer.invoke('net:addresses'),
 
+  /** 查压缩代理状态(当前档位、压缩开关、上下文阈值)。代理没跑时返回 offline。 */
+  proxyStatus: () => ipcRenderer.invoke('proxy:status'),
+  /** 切换任务档位(推理 / 写作 / 通用 / 代码)。 */
+  setProfile: (key) => ipcRenderer.invoke('proxy:setProfile', key),
+  /** 开关自动上下文压缩。 */
+  setCompression: (enabled) => ipcRenderer.invoke('proxy:setCompression', enabled),
+
   /** 订阅状态变更(服务意外退出时主进程会通知)。 */
   onStateChanged: (cb) => {
     const handler = () => cb();
