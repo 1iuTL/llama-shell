@@ -20,6 +20,7 @@
 import http from 'node:http'
 import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { injectPanel } from './ui-inject.mjs'
 
 // 档位定义放在 src/profiles.js(CommonJS),这里借 createRequire 读它 ——
 // 这样界面与代理共用同一份定义,不会各自漂移。
@@ -269,7 +270,7 @@ async function maybeCompress(messages) {
 
 // ------------------------------------------------------------------ 请求转发
 
-/** 把上游响应原样回给客户端(支持流式)。 */
+/** 把上游响应回给客户端(支持流式)。 */
 async function pipeResponse(upstreamRes, res) {
   const headers = {}
   for (const [k, v] of upstreamRes.headers) {
@@ -277,6 +278,38 @@ async function pipeResponse(upstreamRes, res) {
     if (['content-length', 'content-encoding', 'transfer-encoding'].includes(k.toLowerCase())) continue
     headers[k] = v
   }
+
+  // ---- HTML 响应:注入档位面板 ----
+  //
+  // 为什么要在这一层做:llama.cpp 的 Web UI 是预压缩的 Svelte 包,改它要反编译
+  // 重建,而且一升级就白改;代理夹在中间,在返回 HTML 时追加一段自己的脚本最省事。
+  //
+  // 注入之后 content-length 必然变化,所以上面统一丢掉了它,由 Node 用 chunked
+  // 重新计算 —— 这也是"无论如何都不转发 content-length"的原因(编解码后它的
+  // 长度本来就不可信)。
+  const ctype = String(upstreamRes.headers.get('content-type') || '')
+  const isHtml = ctype.includes('text/html')
+  if (isHtml && upstreamRes.body) {
+    let html
+    try {
+      html = await upstreamRes.text()
+    } catch {
+      // 读失败就退回流式,不让注入影响可用性
+      res.writeHead(upstreamRes.status, headers)
+      res.end()
+      return
+    }
+    if (html.includes('id="stove-panel"')) {
+      // 已经注入过(理论上不该发生,HTML 只回一次);原样返回,避免叠加两份。
+      res.writeHead(upstreamRes.status, headers)
+      res.end(html)
+      return
+    }
+    res.writeHead(upstreamRes.status, headers)
+    res.end(injectPanel(html))
+    return
+  }
+
   res.writeHead(upstreamRes.status, headers)
   if (!upstreamRes.body) { res.end(); return }
   const reader = upstreamRes.body.getReader()

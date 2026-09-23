@@ -134,17 +134,27 @@ const t = m.__test;
   //
   // 这里用一个只做 listen 的哑进程占住 8091:它没有 /health、不是我们的子进程,
   // 所以模拟的正是"外部监听者"。
-  const blocker = require('child_process').spawn(process.execPath, ['-e',
-    "require('http').createServer((q,s)=>s.end('x')).listen(8091,'0.0.0.0',()=>setInterval(()=>{},1000))"
-  ], { stdio: 'ignore', windowsHide: true });
-  await new Promise((r) => setTimeout(r, 1500));
-  log('blockerPid', { pid: blocker.pid });
-  log('pidOnPort8091', { pid: t.pidOnPort(8091) });
+  //
+  // ⚠️ 前置条件:8091 必须是空的。如果上面已有真服务在跑(比如 Model Stove
+  // 正开着),这个场景就**不能测** —— 否则哑进程根本占不住端口,而 stopServer
+  // 会把**真服务**当成"外部监听者"杀掉(实测踩过:差点结束掉正在用的服务)。
+  let blockerPid = null;
+  if (t.pidOnPort(8091) !== null) {
+    log('externalSkipped', { reason: '8091 已被占用,跳过(避免杀掉真实服务)' });
+  } else {
+    const blocker = require('child_process').spawn(process.execPath, ['-e',
+      "require('http').createServer((q,s)=>s.end('x')).listen(8091,'0.0.0.0',()=>setInterval(()=>{},1000))"
+    ], { stdio: 'ignore', windowsHide: true });
+    blockerPid = blocker.pid;
+    await new Promise((r) => setTimeout(r, 1500));
+    log('blockerPid', { pid: blockerPid });
+    log('pidOnPort8091', { pid: t.pidOnPort(8091) });
 
-  const stopResult = await t.stopServer();
-  log('stopServerResult', stopResult);
-  await new Promise((r) => setTimeout(r, 1200));
-  log('pidOnPort8091After', { pid: t.pidOnPort(8091) });
+    const stopResult = await t.stopServer();
+    log('stopServerResult', stopResult);
+    await new Promise((r) => setTimeout(r, 1200));
+    log('pidOnPort8091After', { pid: t.pidOnPort(8091) });
+  }
 
   // 停掉之后端口应该不再应答
   let after = null;
@@ -251,13 +261,18 @@ check('停止后端口不再应答', !!(after && (after.unreachable || after.cod
 
 // ---- 外部监听者也要能被停掉 ----
 console.log('\n--- 外部监听者(模拟别处起的服务)---');
-const blockerPid = (() => { const s = step('blockerPid'); return s ? s.pid : null; })();
-const onPort = step('pidOnPort8091');
-const stopRes = step('stopServerResult');
-const onPortAfter = step('pidOnPort8091After');
-check('哑进程已占住 8091', !!(onPort && onPort.pid === blockerPid), `blocker=${blockerPid} found=${onPort && onPort.pid}`);
-check('stopServer 报告停掉了它', !!(stopRes && stopRes.adopted && stopRes.stopped && stopRes.stopped.includes(blockerPid)), JSON.stringify(stopRes));
-check('8091 已释放', !!(onPortAfter && onPortAfter.pid === null), JSON.stringify(onPortAfter));
+const extSkip = step('externalSkipped');
+if (extSkip) {
+  console.log('  - 跳过:' + extSkip.reason);
+} else {
+  const blockerPid = (() => { const s = step('blockerPid'); return s ? s.pid : null; })();
+  const onPort = step('pidOnPort8091');
+  const stopRes = step('stopServerResult');
+  const onPortAfter = step('pidOnPort8091After');
+  check('哑进程已占住 8091', !!(onPort && onPort.pid === blockerPid), `blocker=${blockerPid} found=${onPort && onPort.pid}`);
+  check('stopServer 报告停掉了它', !!(stopRes && stopRes.adopted && stopRes.stopped && stopRes.stopped.includes(blockerPid)), JSON.stringify(stopRes));
+  check('8091 已释放', !!(onPortAfter && onPortAfter.pid === null), JSON.stringify(onPortAfter));
+}
 
 // ---- 状态隔离的断言(写入动作已在补丁脚本里、stopProxy 之前完成)----
 //
