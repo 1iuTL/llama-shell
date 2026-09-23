@@ -84,6 +84,22 @@ try {
   check('注入在 </body> 之前', html.indexOf('stove-panel') < html.lastIndexOf('</body>'))
   check('没有叠加两份', (html.match(/id="stove-panel"/g) || []).length === 1)
 
+  // ---- 可拖动 ----
+  //
+  // 为什么要拖动:面板初始在右下角,而 llama.cpp 的「发送 / 停止」按钮
+  // 就在输入区右下角 —— 固定在那儿会把唯一的发送入口挡住(手机上尤其致命)。
+  // 所以这里钉住拖动相关的实现,免得以后重构时把它弄丢。
+  console.log('\n  --- 可拖动 ---')
+  check('用 Pointer Events(鼠标与触摸一套)', html.includes('pointerdown') && html.includes('pointermove') && html.includes('pointerup'))
+  check('设了 touch-action:none(否则手机上是滚动)', html.includes('touch-action:none'))
+  check('pointercancel 也收尾(来电/手势打断)', html.includes('pointercancel'))
+  check('有拖动阈值,手抖不会误判为拖动', html.includes('dragMoved') && html.includes('< 6'))
+  check('位置记进 localStorage', html.includes('localStorage') && html.includes('stove-panel-pos'))
+  check('越界会被拉回可视区', html.includes('clamp'))
+  check('拖到上方时面板翻到按钮下面', html.includes('stove-below'))
+  check('拖过之后的那次点击不会误开合', html.includes("if (dragMoved)"))
+  check('提示文案在', html.includes('可拖动'))
+
   // 注入之后 content-length 必须被丢掉(长度变了,不能沿用上游的值)
   check('没有沿用上游的 content-length', !r.headers.get('content-length'),
     r.headers.get('content-length') || '(已丢弃,由 Node 重新计算)')
