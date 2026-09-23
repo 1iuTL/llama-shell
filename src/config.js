@@ -129,20 +129,20 @@ const MODELS = [
   {
     id: 'ternary',
     name: 'Bonsai 2 27B 三元版',
-    note: 'PTQ1_0 · 5.54 GB · 思考模式会塌缩成重复字符,不推荐',
+    note: 'PTQ1_0 · 5.54 GB · 思考模式不可用,须关闭思考',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-PTQ1_0.gguf',
     bin: BIN.fast,
     defaultPreset: 'text-64k',
-    warn: '实测:思考模式下 reasoning 会变成上千个连续的 /,且给不出答案。',
+    warn: '实测:思考模式下 reasoning 会塌缩成上千个连续斜杠且答不出。把思考设为「关闭」后可用,但答案尾部可能拖一段废输出。',
   },
   {
     id: 'ternary-heretic',
     name: '三元版 · 去审查(Heretic)',
-    note: 'PTQ1_0 · 5.54 GB · 同样存在塌缩问题,不推荐',
+    note: 'PTQ1_0 · 5.54 GB · 思考模式不可用,须关闭思考',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Heretic-PTQ1_0.gguf',
     bin: BIN.fast,
     defaultPreset: 'text-64k',
-    warn: '实测:思考模式下会塌缩成重复字符。若要用,建议把思考设为「关闭」。',
+    warn: '实测:默认配置下 reasoning 507 个连续斜杠、content 为空。关闭思考后能给出正确答案(尾部可能拖废输出)。',
   },
   {
     id: 'ternary-abliterated',
@@ -151,7 +151,7 @@ const MODELS = [
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf',
     bin: BIN.fast,
     defaultPreset: 'text-64k',
-    warn: '与前两个同属 PTQ1_0,大概率有同样的塌缩问题。',
+    warn: '与前两个同属 PTQ1_0,大概率同样需要关闭思考。',
   },
 ];
 

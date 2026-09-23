@@ -76,6 +76,10 @@ async function api(method, path, body, attempts = 4) {
         method,
         headers: H,
         body: body === undefined ? undefined : JSON.stringify(body),
+        // 必须显式超时:连接卡住时 fetch 会**无限期挂着** —— 既不断开也不抛错,
+        // 于是下面的 catch 永远不触发,重试逻辑形同虚设,脚本就那么干等
+        // (实测卡了十几分钟、毫无输出)。这是必需品,不是保险。
+        signal: AbortSignal.timeout(30000),
       })
       const text = await r.text()
       let json = null
@@ -86,11 +90,20 @@ async function api(method, path, body, attempts = 4) {
         await sleep(2000 * i)
         continue
       }
+      // 配额耗尽要单独报出来 —— 否则会被误当成网络问题白等很久。
+      if (r.status === 403 && /rate limit/i.test(text)) {
+        const reset = r.headers.get('x-ratelimit-reset')
+        const when = reset ? new Date(Number(reset) * 1000).toLocaleTimeString() : '未知'
+        throw new Error(
+          `API 配额耗尽,预计 ${when} 重置。请确认 GH_TOKEN 已设置:` +
+          `带 token 是 5000/小时,不带只有 60/小时。`
+        )
+      }
       return { status: r.status, json, text }
     } catch (e) {
       lastErr = e
       const cause = e && e.cause ? (e.cause.code || e.cause.message) : e.message
-      console.log(`    网络失败 ${cause},${i * 2} 秒后重试 ...`)
+      console.log(`    第 ${i}/${attempts} 次失败: ${cause}`)
       if (i < attempts) await sleep(2000 * i)
     }
   }
