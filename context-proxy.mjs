@@ -344,7 +344,9 @@ const server = http.createServer(async (req, res) => {
   // 内联脚本可能被 CSP 或某些拦截策略挡掉,而元素照旧渲染 ——
   // 表现就是"面板在,但点不动、拖不动"。外链不受内联策略影响。
   // 另外这里显式 no-store,免得手机上一直用缓存里的旧面板。
-  if (req.url === PANEL_SCRIPT_PATH) {
+  // 用 startsWith 而不是全等:脚本 URL 上带了 ?v=N 做缓存失效,
+  // 全等匹配会因为查询串而漏掉。
+  if (req.url === PANEL_SCRIPT_PATH || req.url.startsWith(PANEL_SCRIPT_PATH + '?')) {
     res.writeHead(200, {
       'Content-Type': 'application/javascript; charset=utf-8',
       'Cache-Control': 'no-store, must-revalidate',

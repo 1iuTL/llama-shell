@@ -12,26 +12,31 @@
 //
 // 请求走代理自己的 /_bridge 接口,所以不带 API Key 也能用。
 //
-// 关于位置:默认在**右上角**,并且可以拖动,位置记在 localStorage 里。
+// 关于位置:**默认就在右上角,而且这是纯 HTML+CSS 决定的,不依赖脚本**。
 //
-// 为什么不放右下角:llama.cpp 的输入区右下角就是「发送 / 停止」按钮,
-// 固定在那儿会把手机上唯一的发送入口挡住。
+// 这一点是被现实逼出来的:面板初始在右下角时挡住了「发送」按钮,而改成
+// "可以拖动"之后,手机上长按会触发系统文字选取、pointermove 根本没机会跑,
+// 拖动等于没有。更麻烦的是故障表现是"看起来改了但没生效" —— 脚本有没有跑
+// 从界面上一眼看不出来。
 //
-// 关于长按:光靠 user-select:none 不够 —— 实测长按会弹出系统的文字选取/
-// 复制菜单,而且 pointermove 根本没机会跑。所以要几层一起上:
-//   - user-select 与 -webkit-touch-callout 都关掉
-//   - pointerdown 里 preventDefault,不让浏览器进入长按手势
-//   - contextmenu 也吞掉
-//   - touch-action:none 挡住滚动接管
+// 所以现在的设计是:
+//   - 位置由 CSS 定死在右上角(纯静态,脚本挂了也不会跑到右下角挡发送键)
+//   - **拖动改成拖标题栏**(面板里那行「任务档位」),而不是拖按钮本身
+//   - 面板用 <details> 实现开合 —— 纯 HTML 行为,不吃长按、不需要脚本
+//   - 标题旁边有个版本标记,用来一眼确认手机上跑的是哪一版
+export const PANEL_VERSION = 3
 
-export const PANEL_HTML = `<div id="stove-panel" class="stove-collapsed stove-below">
-  <button id="stove-toggle" type="button" title="任务档位(可按住拖动)">档位</button>
+export const PANEL_HTML = `<div id="stove-panel">
+  <button id="stove-toggle" type="button" title="任务档位">档位</button>
   <div id="stove-body">
-    <div class="stove-h">任务档位 <span id="stove-dot"></span></div>
+    <div class="stove-h" id="stove-drag">
+      <span class="stove-grip">⠿</span>任务档位 <span id="stove-dot"></span>
+      <span class="stove-ver">v${PANEL_VERSION}</span>
+    </div>
     <div id="stove-list"></div>
     <div id="stove-note"></div>
     <label class="stove-opt"><input type="checkbox" id="stove-compress" /> 自动压缩上下文</label>
-    <div class="stove-tip">按住「档位」可拖动 · <a id="stove-reset" href="#">复位</a></div>
+    <div class="stove-tip">拖这行标题可移动面板 · <a id="stove-reset" href="#">复位</a></div>
   </div>
 </div>`
 
@@ -41,23 +46,23 @@ export const PANEL_CSS = `
   -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
 #stove-panel *{box-sizing:border-box;
   -webkit-user-select:none;user-select:none;-webkit-touch-callout:none}
-#stove-toggle{background:#1f6feb;color:#fff;border:0;border-radius:999px;
-  padding:9px 15px;font:600 13px/1 system-ui,sans-serif;cursor:grab;
-  box-shadow:0 3px 12px rgba(0,0,0,.4);
-  touch-action:none;            /* 拖动时不要触发页面滚动 */
-  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;
+/* 按钮固定在面板容器里;容器的位置由上面的 top/right 决定 */
+#stove-toggle{display:block;margin-left:auto;background:#1f6feb;color:#fff;border:0;
+  border-radius:999px;padding:9px 15px;font:600 13px/1 system-ui,sans-serif;
+  cursor:pointer;box-shadow:0 3px 12px rgba(0,0,0,.4);
   -webkit-tap-highlight-color:transparent}
-#stove-toggle:active{cursor:grabbing}
-#stove-panel.stove-dragging #stove-toggle{opacity:.85}
-#stove-body{display:none;width:236px;margin-bottom:8px;background:#161b22;
+#stove-body{display:none;width:236px;margin-top:8px;background:#161b22;
   border:1px solid #30363d;border-radius:11px;padding:11px;
   box-shadow:0 6px 24px rgba(0,0,0,.5);max-height:64vh;overflow:auto}
 #stove-panel.stove-open #stove-body{display:block}
-/* 拖到屏幕上半部分时,把面板翻到按钮下面,免得顶出可视区 */
-#stove-panel.stove-below{display:flex;flex-direction:column-reverse}
-#stove-panel.stove-below #stove-body{margin-bottom:0;margin-top:8px}
 .stove-h{font-weight:600;font-size:12px;color:#8b949e;margin-bottom:8px;
-  display:flex;align-items:center;gap:6px}
+  display:flex;align-items:center;gap:6px;
+  cursor:grab;touch-action:none;      /* 标题栏是拖动把手 */
+  border-bottom:1px solid #21262d;padding-bottom:7px}
+.stove-h:active{cursor:grabbing}
+.stove-grip{opacity:.5;letter-spacing:-1px}
+.stove-ver{margin-left:auto;font-weight:400;font-size:10px;color:#6e7681;
+  border:1px solid #30363d;border-radius:4px;padding:0 4px}
 #stove-dot{width:7px;height:7px;border-radius:50%;background:#8b949e;display:inline-block}
 #stove-dot.on{background:#3fb950;box-shadow:0 0 6px #3fb950}
 #stove-dot.err{background:#f85149}
@@ -135,160 +140,150 @@ export const PANEL_JS = `
       .catch(function () { $('stove-note').textContent = '切换失败'; });
   }
 
-  // ---------- 拖动 ----------
+  // ---------- 拖动(拖标题栏,不是拖按钮)----------
   //
-  // 用 Pointer Events,鼠标和触摸一套代码。
+  // 为什么改拖标题栏:原来拖按钮本身,**手机上长按会触发系统的文字选取/复制
+  // 菜单**,pointermove 根本没机会跑,拖动等于没有。标题栏在面板内部,用户是
+  // 先点开面板再拖,这个动作不会被系统当成"长按选字"。
   //
-  // 关于长按:实测长按会弹出系统的**文字选取/复制菜单**,而 pointermove 根本
-  // 没机会跑 —— 也就是说拖动完全失效。光靠 CSS 的 user-select:none 不够,
-  // 所以这里几层一起上:
-  //   - CSS 里对面板整体关掉 user-select 与 -webkit-touch-callout
-  //   - pointerdown 里 preventDefault,阻止浏览器进入长按手势
-  //   - contextmenu 直接吞掉
-  //   - CSS 里 touch-action:none 挡住滚动接管
-  // 另外把默认位置放到**右上角**(而不是右下角的发送按钮旁边),
-  // 这样即使拖动在某台设备上仍然不灵,也不会挡住输入区。
+  // 但更重要的是:**按钮的位置现在由 CSS 定死在右上角,不依赖任何脚本**。
+  // 所以即使拖动在某台设备上仍然不灵,面板也不会跑到右下角去挡发送按钮 ——
+  // 这是这次改动的核心,毕竟"拖动不好用"最多是不方便,而"挡住发送键"是没法用。
   //
-  // 位置键带版本号:改成右上角之后,旧的右下角坐标不该再被沿用,
+  // 位置键带版本号:换了默认位置后,旧的右下角坐标不该再被沿用,
   // 否则用户会以为"改了没生效"。
-  var POS_KEY = 'stove-panel-pos-v2';
+  var POS_KEY = 'stove-panel-pos-v3';
   var DEFAULT_POS = { top: 14, right: 14 };
 
   var dragMoved = false;
 
   /** 用 left/top 定位。right/bottom 归零,否则会和 left/top 打架。 */
-  function applyPos(btn, x, y) {
-    btn.style.left = x + 'px';
-    btn.style.top = y + 'px';
-    btn.style.right = 'auto';
-    btn.style.bottom = 'auto';
+  function applyPos(box, x, y) {
+    box.style.left = x + 'px';
+    box.style.top = y + 'px';
+    box.style.right = 'auto';
+    box.style.bottom = 'auto';
   }
 
   function savePos(x, y) {
     try { localStorage.setItem(POS_KEY, JSON.stringify({ x: x, y: y })); } catch (e) {}
   }
 
-  function clearPos(btn) {
+  function clearPos(box) {
     try { localStorage.removeItem(POS_KEY); } catch (e) {}
-    btn.style.left = 'auto';
-    btn.style.top = DEFAULT_POS.top + 'px';
-    btn.style.right = DEFAULT_POS.right + 'px';
-    btn.style.bottom = 'auto';
+    box.style.left = 'auto';
+    box.style.top = DEFAULT_POS.top + 'px';
+    box.style.right = DEFAULT_POS.right + 'px';
+    box.style.bottom = 'auto';
   }
 
-  function restorePos(btn) {
+  function restorePos(box) {
     var saved = null;
     try { saved = JSON.parse(localStorage.getItem(POS_KEY) || 'null'); } catch (e) {}
     if (saved && typeof saved.x === 'number' && typeof saved.y === 'number') {
-      applyPos(btn, saved.x, saved.y);
+      applyPos(box, saved.x, saved.y);
     }
   }
 
-  /** 把按钮拉回可视区;返回修正后的坐标(没定位过就返回 null)。 */
-  function clamp(btn) {
-    var r = btn.getBoundingClientRect();
-    var x = parseFloat(btn.style.left);
-    var y = parseFloat(btn.style.top);
+  /** 把面板拉回可视区;返回修正后的坐标(没定位过就返回 null)。 */
+  function clamp(box) {
+    var r = box.getBoundingClientRect();
+    var x = parseFloat(box.style.left);
+    var y = parseFloat(box.style.top);
     if (isNaN(x) || isNaN(y)) return null;
     var maxX = window.innerWidth - r.width - 8;
     var maxY = window.innerHeight - r.height - 8;
     x = Math.min(Math.max(8, x), Math.max(8, maxX));
     y = Math.min(Math.max(8, y), Math.max(8, maxY));
-    applyPos(btn, x, y);
+    applyPos(box, x, y);
     return { x: x, y: y };
   }
 
-  /** 按钮在上半屏时,面板翻到按钮下方,免得展开后顶出可视区。 */
-  function updateFlip(panel, btn) {
-    var r = btn.getBoundingClientRect();
-    panel.classList.toggle('stove-below', r.top < window.innerHeight * 0.45);
-  }
-
   function bindDrag() {
-    var panel = $('stove-panel');
-    var btn = $('stove-toggle');
-    if (!panel || !btn) return;
+    var box = $('stove-panel');
+    var handle = $('stove-drag');
+    if (!box || !handle) return;
 
-    restorePos(btn);
-    updateFlip(panel, btn);
+    restorePos(box);
 
     var startX = 0, startY = 0, originLeft = 0, originTop = 0, active = false;
 
-    btn.addEventListener('pointerdown', function (e) {
+    handle.addEventListener('pointerdown', function (e) {
       active = true;
       dragMoved = false;
-      var r = btn.getBoundingClientRect();
+      var r = box.getBoundingClientRect();
       originLeft = r.left;
       originTop = r.top;
       startX = e.clientX;
       startY = e.clientY;
-      try { btn.setPointerCapture(e.pointerId); } catch (err) {}
-      panel.classList.add('stove-dragging');
+      try { handle.setPointerCapture(e.pointerId); } catch (err) {}
       // 阻止浏览器把这次按下当成"长按选取文字"的起点
       if (e.cancelable) e.preventDefault();
     });
 
-    btn.addEventListener('pointermove', function (e) {
+    handle.addEventListener('pointermove', function (e) {
       if (!active) return;
       var dx = e.clientX - startX;
       var dy = e.clientY - startY;
       if (!dragMoved && Math.abs(dx) + Math.abs(dy) < 6) return;  // 阈值内当作点击
       dragMoved = true;
-      applyPos(btn, originLeft + dx, originTop + dy);
-      updateFlip(panel, btn);
+      applyPos(box, originLeft + dx, originTop + dy);
       if (e.cancelable) e.preventDefault();
     });
 
     function end(e) {
       if (!active) return;
       active = false;
-      panel.classList.remove('stove-dragging');
-      try { btn.releasePointerCapture(e.pointerId); } catch (err) {}
+      try { handle.releasePointerCapture(e.pointerId); } catch (err) {}
       if (dragMoved) {
-        var c = clamp(btn);
+        var c = clamp(box);
         if (c) savePos(c.x, c.y);
       }
     }
-    btn.addEventListener('pointerup', end);
-    btn.addEventListener('pointercancel', end);
-    // 拖出按钮范围再松手也要收尾,否则会卡在拖动状态
-    btn.addEventListener('lostpointercapture', end);
-
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
+    // 拖出把手范围再松手也要收尾,否则会卡在拖动状态
+    handle.addEventListener('lostpointercapture', end);
     // 长按时浏览器会弹系统菜单(复制/搜索),直接吞掉
-    btn.addEventListener('contextmenu', function (e) { e.preventDefault(); });
-
-    // 点一下开合面板;拖过之后的那次 click 要忽略掉
-    btn.addEventListener('click', function (e) {
-      if (dragMoved) { dragMoved = false; e.preventDefault(); return; }
-      panel.classList.toggle('stove-open');
-      if (panel.classList.contains('stove-open')) load();
-    });
+    handle.addEventListener('contextmenu', function (e) { e.preventDefault(); });
 
     // 复位
     var reset = $('stove-reset');
     if (reset) {
       reset.addEventListener('click', function (e) {
         e.preventDefault();
-        clearPos(btn);
-        updateFlip(panel, btn);
+        clearPos(box);
       });
     }
 
     // 横竖屏切换或窗口变化后把面板拉回可视区
-    window.addEventListener('resize', function () {
-      if (clamp(btn)) updateFlip(panel, btn);
-    });
+    window.addEventListener('resize', function () { clamp(box); });
   }
 
   function bindControls() {
     if (!$('stove-panel')) return false;
-    $('stove-compress').onchange = function (e) {
-      fetch('/_bridge/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled: !!e.target.checked })
-      }).catch(function () {});
-    };
+
+    // 开合面板
+    var btn = $('stove-toggle');
+    if (btn) {
+      btn.onclick = function () {
+        var box = $('stove-panel');
+        box.classList.toggle('stove-open');
+        if (box.classList.contains('stove-open')) load();
+      };
+    }
+
+    var cb = $('stove-compress');
+    if (cb) {
+      cb.onchange = function (e) {
+        fetch('/_bridge/config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled: !!e.target.checked })
+        }).catch(function () {});
+      };
+    }
+
     bindDrag();
     load();
     return true;
@@ -325,7 +320,10 @@ export const PANEL_SCRIPT_PATH = '/_stove/panel.js'
  */
 export function injectPanel(html) {
   const head = `<style id="stove-style">${PANEL_CSS}</style>`
-  const tail = `${PANEL_HTML}<script src="${PANEL_SCRIPT_PATH}" defer></script>`
+  // 脚本 URL 带版本号:换版本时浏览器一定会重新取,不会拿旧的面板脚本。
+  // (路径本身也设了 no-store,但查询串是第二道保险 —— 有些内置浏览器
+  //  对 no-store 处理得并不认真。)
+  const tail = `${PANEL_HTML}<script src="${PANEL_SCRIPT_PATH}?v=${PANEL_VERSION}" defer></script>`
 
   let out = html
   if (out.includes('</head>')) out = out.replace('</head>', `${head}</head>`)

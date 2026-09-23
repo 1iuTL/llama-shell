@@ -90,8 +90,18 @@ try {
   // 表现就是"面板在,但点不动、拖不动"。外链走独立资源请求,
   // 不受内联策略影响,而且能单独设缓存头、单独请求来看内容。
   console.log('\n  --- 脚本外链 ---')
-  check('HTML 用外链引用面板脚本', html.includes('src="/_stove/panel.js"'))
+  check('HTML 用外链引用面板脚本', /src="\/_stove\/panel\.js(\?v=\d+)?"/.test(html))
+  check('脚本 URL 带版本号(缓存失效)', /src="\/_stove\/panel\.js\?v=\d+"/.test(html))
   check('HTML 里没有内联的面板脚本', !html.includes('__stovePanelLoaded'))
+
+  // 带版本号的那条也要能取到(代理路由用了 startsWith,不然会 404)
+  const withV = html.match(/src="(\/_stove\/panel\.js\?v=\d+)"/)
+  if (withV) {
+    const rv = await fetch(`http://127.0.0.1:${PORT}${withV[1]}`)
+    check('带 ?v= 的脚本路径可取', rv.status === 200, 'HTTP ' + rv.status)
+  } else {
+    check('带 ?v= 的脚本路径可取', false, 'HTML 里没找到带版本号的 URL')
+  }
 
   const sp = await fetch(`http://127.0.0.1:${PORT}/_stove/panel.js`)
   const script = await sp.text()
@@ -115,21 +125,24 @@ try {
   check('面板会查询档位', all.includes('/_bridge/status'))
   check('面板会切换档位', all.includes('/_bridge/config'))
 
-  // ---- 可拖动 ----
+  // ---- 拖动 ----
   //
-  // 为什么要拖动:面板初始在右下角,而 llama.cpp 的「发送 / 停止」按钮
-  // 就在输入区右下角 —— 固定在那儿会把唯一的发送入口挡住(手机上尤其致命)。
-  // 所以这里钉住拖动相关的实现,免得以后重构时把它弄丢。
-  console.log('\n  --- 可拖动 ---')
+  // 现在拖的是**面板里的标题栏**(id=stove-drag),不是按钮本身 ——
+  // 因为手机上拖按钮会触发系统长按选字,pointermove 根本没机会跑。
+  //
+  // 但更要紧的是:**按钮位置由 CSS 定死在右上角,不依赖脚本**。
+  // 即使拖动在某台设备上仍不灵,面板也不会跑到右下角挡发送键。
+  console.log('\n  --- 拖动(拖标题栏) ---')
+  check('拖动把手是标题栏', all.includes('id="stove-drag"'))
+  check('拖的是把手而不是按钮', /pointerdown/.test(script) && script.includes("handle.addEventListener('pointerdown'"))
   check('用 Pointer Events(鼠标与触摸一套)', all.includes('pointerdown') && all.includes('pointermove') && all.includes('pointerup'))
-  check('设了 touch-action:none(否则手机上是滚动)', all.includes('touch-action:none'))
+  check('把手设了 touch-action:none(否则手机上是滚动)', /\.stove-h\{[^}]*touch-action:none/.test(all))
   check('pointercancel 也收尾(来电/手势打断)', all.includes('pointercancel'))
   check('有拖动阈值,手抖不会误判为拖动', all.includes('dragMoved') && all.includes('< 6'))
-  check('位置记进 localStorage', all.includes('localStorage') && all.includes('stove-panel-pos'))
+  check('位置记进 localStorage', all.includes('localStorage') && all.includes('stove-panel-pos-v3'))
   check('越界会被拉回可视区', all.includes('clamp'))
-  check('拖到上方时面板翻到按钮下面', all.includes('stove-below'))
   check('拖过之后的那次点击不会误开合', all.includes('if (dragMoved)'))
-  check('提示文案在', all.includes('可拖动'))
+  check('提示文案在', all.includes('可拖动') || all.includes('可移动'))
 
   // ---- 长按防御 ----
   //
@@ -143,13 +156,16 @@ try {
   check('lostpointercapture 也收尾', script.includes('lostpointercapture'))
   check('有复位入口(拖丢了能拉回来)', all.includes('stove-reset'))
 
-  // ---- 默认位置必须在右上角 ----
+  // ---- 默认位置必须在右上角,而且不依赖脚本 ----
   //
   // 右下角是 llama.cpp 的「发送 / 停止」按钮 —— 挡在那里手机上就没法发消息了。
+  // 关键:位置写在 CSS 里(静态),不是在脚本里设 —— 脚本没跑也照样在右上角。
   console.log('\n  --- 默认位置 ---')
   check('默认在右上角(不是右下角)', /#stove-panel\{[^}]*top:14px/.test(html) && /#stove-panel\{[^}]*right:14px/.test(html))
   check('默认不在右下角', !/#stove-panel\{[^}]*bottom:14px/.test(html))
-  check('位置键带版本号(避免沿用旧的右下角坐标)', script.includes('stove-panel-pos-v2'))
+  check('位置不依赖脚本设置(HTML 里就有 top/right)', /id="stove-panel"/.test(html) && /#stove-panel\{[^}]*top:14px/.test(html))
+  check('位置键带版本号(避免沿用旧的右下角坐标)', script.includes('stove-panel-pos-v3'))
+  check('面板带版本标记(一眼确认手机上跑的是哪版)', /class="stove-ver"/.test(html) || html.includes('stove-ver'))
 
   // ---- 脚本本身要能作为"经典脚本"编译 ----
   //
