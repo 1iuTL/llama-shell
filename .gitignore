@@ -19,3 +19,4 @@ Desktop.ini
 .push-tmp/
 .probe-repo/
 .api-push-cache/
+.api-push-tmp/

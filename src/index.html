@@ -148,6 +148,12 @@
   .item .d { color: var(--dim); font-size: 11px; margin-top: 2px; }
   .item.missing { opacity: .45; cursor: not-allowed; }
   .item.missing .d { color: var(--warn); }
+  /* 已知有问题的模型:黄色警示条,让人一眼看出别选它 */
+  .item .warnline {
+    margin-top: 5px; padding: 4px 6px; border-radius: 4px;
+    background: #2a2211; border: 1px solid #55451a; color: #e8c46a;
+    font-size: 10.5px; line-height: 1.45;
+  }
 
   #controls { padding: 12px 14px; border-top: 1px solid var(--line); }
   button {
@@ -409,8 +415,22 @@ function renderModels() {
   for (const m of CATALOGUE.models) {
     const b = document.createElement('button');
     b.className = 'item' + (m.id === selModel ? ' sel' : '') + (m.present ? '' : ' missing');
-    b.innerHTML = `<div class="t">${m.name}</div>
-      <div class="d">${m.present ? m.note : '文件缺失:' + m.file}</div>`;
+    // 逐段用 textContent 填,避免模型名里的特殊字符被当成 HTML
+    const t = document.createElement('div');
+    t.className = 't';
+    t.textContent = m.name;
+    const d = document.createElement('div');
+    d.className = 'd';
+    d.textContent = m.present ? m.note : '文件缺失:' + m.file;
+    b.appendChild(t);
+    b.appendChild(d);
+    // 已知有问题的模型直接标在卡片上 —— 否则用户只能靠名字猜
+    if (m.warn) {
+      const w = document.createElement('div');
+      w.className = 'warnline';
+      w.textContent = '⚠ ' + m.warn;
+      b.appendChild(w);
+    }
     if (m.present) {
       b.onclick = () => {
         selModel = m.id;

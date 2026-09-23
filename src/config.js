@@ -25,11 +25,12 @@ const BIN = {
 // 思考强度的 token 上限。
 //
 // llama-server 的 --reasoning-budget 默认是 **-1(无限)**。这是一道**保险**,
-// 不是常态约束:目的是万一模型陷进重复生成(实测见过 reasoning 区一直刷同一个
-// 字符、几十秒不产出答案),有个兜底能自己收住,而不是必须手动停服务。
+// 不是常态约束。
 //
-// 取值原则:要宽到让难题的深度思考跑完,只在真正失控时才触发。
-// 64K 上下文里 32768 约占一半,足够长链推理;想完全不干预就选「不限」。
+// 但要看清它的作用边界:实测这类极低比特量化模型的退化是**随机**的
+// (同一配置 3 次里 1 次正常、2 次塌缩成连续斜杠),而且**降温、加重复惩罚
+// 都不能改善**(temp 0.6 反而 3/3 全崩)。所以预算只能限制"崩多久",
+// 不能减少"崩不崩"。真正的解法是换模型或关掉思考,见 README。
 //
 // 注意别把它和"思考档位"混为一谈:档位由 --reasoning-effort 控制,预算只
 // 限制总长度。两者独立。
@@ -42,10 +43,18 @@ const REASONING_BUDGETS = [
 
 const DEFAULT_REASONING_BUDGET = '32768';
 
-// 预算耗尽时注入的收尾提示。不设的话模型可能被硬截断在思考中途,
-// 拿到半截思考而没有答案;给了这句它会转向作答。
-const REASONING_BUDGET_MESSAGE =
-  '思考预算已用完,请立即基于已有分析给出最终答案。';
+// 预算耗尽时**不做**任何注入。
+//
+// 这里原本有一条中文提示语("思考预算已用完,请立即基于已有分析给出最终答案"),
+// 实测它是**退化触发器**:同一模型、同一提示词、同一采样参数下,
+//   - 加上它:reasoning 1026 字符里 1016 个是 '/' (99%),content 为空,答不出
+//   - 去掉它:reasoning 仅 29 字符,内容正常,正常作答
+// 复现 100% 稳定。原因大概是这类量化模型对输入扰动极敏感,一段固定的长中文串
+// 会把它推入重复塌缩。
+//
+// 所以预算只做"截断",不做"提醒":宁可停在思考中途,也不要因为一句提示
+// 把整轮输出废掉。
+const REASONING_BUDGET_MESSAGE = null;
 
 const MMPROJ = 'D:\\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf';
 
@@ -97,38 +106,52 @@ const REASONING = {
 };
 
 // 这里的每个模型都已经在本机下载并校验过。
+//
+// 关于 PTQ1_0 那三个:实测它们在**思考模式下会塌缩**。同一个提示词
+// ("1+1等于几")、同一套参数,reasoning 会变成 1000 多个连续的 '/'
+// 且 content 为空 —— 完全答不出。两个不同问题各复现一次,3 次试验里 1 次
+// 直接崩、两次侥幸通过。
+//
+// 而 Q1_0 恰恰相反:3/3 正常,reasoning 有完整的分步分析(含自检),
+// 两个问题都给出正确答案,且几乎没有重复。
+//
+// 所以**默认用 Q1_0**。这不是比特数的问题(Q1_0 位数更低反而更稳),
+// 更像是 PTQ1_0 这个较新的三值格式在该模型上实现不佳。
 const MODELS = [
+  {
+    id: 'onbit',
+    name: 'Bonsai 27B 1-bit',
+    note: 'Q1_0 · 3.54 GB · 实测稳定,默认推荐',
+    file: MODELS_DIR + 'Bonsai-27B-Q1_0.gguf',
+    bin: BIN.stock,
+    defaultPreset: 'text-64k',
+  },
   {
     id: 'ternary',
     name: 'Bonsai 2 27B 三元版',
-    note: 'PTQ1_0 · 5.54 GB · 质量保留 98.2%',
+    note: 'PTQ1_0 · 5.54 GB · 思考模式会塌缩成重复字符,不推荐',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-PTQ1_0.gguf',
     bin: BIN.fast,
     defaultPreset: 'text-64k',
+    warn: '实测:思考模式下 reasoning 会变成上千个连续的 /,且给不出答案。',
   },
   {
     id: 'ternary-heretic',
     name: '三元版 · 去审查(Heretic)',
-    note: 'PTQ1_0 · 5.54 GB · 拒答率大幅降低',
+    note: 'PTQ1_0 · 5.54 GB · 同样存在塌缩问题,不推荐',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Heretic-PTQ1_0.gguf',
     bin: BIN.fast,
     defaultPreset: 'text-64k',
+    warn: '实测:思考模式下会塌缩成重复字符。若要用,建议把思考设为「关闭」。',
   },
   {
     id: 'ternary-abliterated',
     name: '三元版 · 去审查(Abliterated)',
-    note: 'PTQ1_0 · 5.54 GB · 实测零拒答',
+    note: 'PTQ1_0 · 5.54 GB · 未单独复测,但同属该量化',
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf',
     bin: BIN.fast,
     defaultPreset: 'text-64k',
-  },
-  {
-    id: 'onbit',
-    name: 'Bonsai 27B 1-bit',
-    note: 'Q1_0 · 3.54 GB · 最省显存,速度最快',
-    file: MODELS_DIR + 'Bonsai-27B-Q1_0.gguf',
-    bin: BIN.stock,
-    defaultPreset: 'text-64k',
+    warn: '与前两个同属 PTQ1_0,大概率有同样的塌缩问题。',
   },
 ];
 
@@ -203,7 +226,10 @@ function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budget
     const budget = resolveBudget(budgetKey);
     if (budget.value >= 0) {
       args.push('--reasoning-budget', String(budget.value));
-      args.push('--reasoning-budget-message', REASONING_BUDGET_MESSAGE);
+      // 提示语默认是 null(实测它会诱发退化),只有显式配置了才加。
+      if (REASONING_BUDGET_MESSAGE) {
+        args.push('--reasoning-budget-message', REASONING_BUDGET_MESSAGE);
+      }
     }
   }
 

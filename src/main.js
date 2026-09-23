@@ -302,6 +302,7 @@ ipcMain.handle('catalogue', () => ({
     defaultPreset: m.defaultPreset,
     present: modelExists(m),
     binPresent: binExists(m),
+    warn: m.warn || null,
   })),
   presets: Object.entries(PRESETS).map(([k, v]) => ({
     key: k, label: v.label, hint: v.hint, ctx: v.ctx, vision: v.vision,
