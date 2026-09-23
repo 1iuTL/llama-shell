@@ -276,6 +276,63 @@ Key 存放在 `%APPDATA%\model-stove\settings.json`(Windows)。它不进仓库,�
 - **局域网模式下自动加 `--no-slots`。** `/slots` 默认会回报每个槽位正在处理的内容 —— 也就是别人能看到你正在问什么。绑到网络上时关掉。
 - **日志里隐藏 Key。** 启动横幅会把这个参数打成 `<已隐藏>`,免得 Key 明文留在日志文件里被随手分享出去。
 
+## 自动上下文压缩(`context-proxy.mjs`)
+
+llama.cpp 自带的 Web UI 每次把**完整对话历史**发给 `llama-server`。聊得久了历史必然撑爆上下文,然后要么报错、要么被静默截断 —— 上游界面没有压缩功能,也不该去改它,所以在中间加一层代理:
+
+```
+浏览器 → context-proxy.mjs(:8092) → llama-server(:8091)
+              │
+              └─ 历史超过阈值时,把较早的对话交给模型总结成一段,替换掉原文
+```
+
+### 跑起来
+
+```powershell
+# 先在 Model Stove 里点「启动」,让 llama-server 跑起来
+node context-proxy.mjs
+```
+
+然后手机浏览器改连 **`http://<电脑IP>:8092/`**(不再是 8091)。功能开关与实时状态:
+
+```
+GET  http://<电脑IP>:8092/_bridge/status
+POST http://<电脑IP>:8092/_bridge/config   {"enabled":true}
+```
+
+默认**开启**,阈值是上下文的 60%,保留最近 4 轮原文。
+
+### 为什么要另起端口:localStorage 按地址隔离
+
+浏览器把聊天记录存在 **localStorage** 里,而 localStorage 是**按来源地址隔离**的。手机以前连 `8091`,记录就存在 `8091` 这个来源下;改连 `8092` 后是另一个来源,**看不到原来的历史会话**。
+
+记录没有丢,只是不在新地址下。想保留旧对话:
+
+1. 仍用 `8091` 打开旧地址 → 逐个会话复制内容出来
+2. 或者从此就用 `8092`,把旧记录留在原处备查
+
+llama-server 刻意留在 8091 不动,这样 Model Stove、桌面端、以及你原有的书签都不受影响。
+
+### 一个容易踩的坑:system 消息必须只有一条且在开头
+
+把摘要作为**新的** system 消息插到原 system 之后,会直接报错:
+
+```
+Jinja Exception: System message must be at the beginning.
+```
+
+所以摘要必须**并入**原有 system 内容,而不是新增一条。这一点上游模板不会容忍。
+
+### 首次对话慢是正常的,与压缩无关
+
+模型加载后的**第一次**推理要建 CUDA 图、分配 KV cache,约 30 秒量级。实测同一个请求连发三次:
+
+```
+#1: 32.5s     #2: 1.3s     #3: 0.8s
+```
+
+第二次起就正常了。**不要把这 30 秒归因于压缩** —— 我一开始就误判过:当时把"某个参数让总结从 35s 降到 3s"当成结论,后来连发三次才发现那只是"它排在第二位、已经预热过了"。同一进程里依次跑多个配置,后者天然更快,对比时必须重复或打乱顺序。
+
 ## 踩过的坑(改代码前值得看)
 
 这几条和具体模型无关,是 Electron + 子进程管理本身的坑。
@@ -322,13 +379,15 @@ Key 存放在 `%APPDATA%\model-stove\settings.json`(Windows)。它不进仓库,�
 ## 目录
 
 ```
-src/config.js     模型与预设清单(唯一需要按环境改的文件)
-src/main.js       主进程:进程编排、IPC、日志、局域网地址枚举
-src/preload.js    contextBridge 暴露的白名单接口
-src/settings.js   外壳自己的设置(API Key、局域网开关),存 userData
-src/index.html    侧栏界面 + 内嵌 webview
-src/qr.js         零依赖二维码生成器(给手机访问面板用)
-启动.bat          Windows 启动器(用绝对路径,避开空格截断)
+src/config.js        模型与预设清单(唯一需要按环境改的文件)
+src/main.js          主进程:进程编排、IPC、日志、局域网地址枚举
+src/preload.js       contextBridge 暴露的白名单接口
+src/settings.js      外壳自己的设置(API Key、局域网开关),存 userData
+src/index.html       侧栏界面 + 内嵌 webview
+src/qr.js            零依赖二维码生成器(给手机访问面板用)
+context-proxy.mjs    自动上下文压缩代理(可选,手机访问时用)
+qq-bridge.mjs        QQ 官方机器人桥接(未部署,见文件头说明)
+启动.bat             Windows 启动器(用绝对路径,避开空格截断)
 ```
 
 `src/qr.js` 是自己写的,不是引包 —— 外壳要求完全离线,而这里只需要编一条几十字节的局域网地址。它只实现 byte 模式 + 纠错等级 L + 版本 1–10。生成结果与参考实现(经典 `qrcode.js`)逐格对拍一致,并有往返解码测试。

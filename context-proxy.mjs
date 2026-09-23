@@ -1,0 +1,394 @@
+// 上下文压缩代理:夹在浏览器界面与 llama-server 之间。
+//
+// 为什么需要这一层:llama.cpp 自带的 Web UI 每次把**完整对话历史**发给
+// llama-server。聊得久了历史必然撑爆上下文(-c 65536),然后要么报错、
+// 要么被静默截断。上游界面没有压缩功能,也不该去改它,所以在中间加一层。
+//
+// 数据流:
+//   浏览器 → 本代理(:8092) → llama-server(:8091)
+//                 │
+//                 └─ 历史过长时,把较早的对话交给模型总结成一段,替换掉原文
+//
+// 为什么另起端口而不是顶替 8091:llama-server 留在原位,Model Stove 与桌面端
+// 完全不受影响。代价是浏览器的 localStorage 按来源地址隔离,**换端口等于换
+// 存储**,手机上原有的历史会话不会出现在新地址下(没有丢,只是不在那儿)。
+//
+// 用法:node context-proxy.mjs
+//   PROXY_PORT   本代理端口,默认 8092
+//   UPSTREAM     上游地址,默认 http://127.0.0.1:8091
+//   COMPRESS=0   启动时关闭压缩(也可用 _bridge 接口在运行时切换)
+import http from 'node:http'
+import { appendFileSync, mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs'
+
+// ------------------------------------------------------------------ 配置
+
+const PROXY_PORT = Number(process.env.PROXY_PORT || 8092)
+const UPSTREAM = process.env.UPSTREAM || 'http://127.0.0.1:8091'
+const UPSTREAM_URL = new URL(UPSTREAM)
+
+const LOG_DIR = 'C:\\deepseek harness\\model-stove\\logs'
+if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true })
+const LOG_FILE = `${LOG_DIR}\\context-proxy.log`
+const STATE_FILE = `${LOG_DIR}\\context-proxy-state.json`
+
+function log(...args) {
+  const line = `[${new Date().toISOString()}] ${args.join(' ')}`
+  console.log(line)
+  try { appendFileSync(LOG_FILE, line + '\n', 'utf8') } catch { /* 日志失败不影响服务 */ }
+}
+
+/**
+ * 运行时状态(可热切换,不用重启)。
+ *
+ * 压缩默认**开启** —— 它的目的是防止上下文溢出,属于"应该有"的保护;
+ * 想验证模型原始行为时可以关掉对比。
+ */
+const state = {
+  enabled: process.env.COMPRESS !== '0',
+  // 触发阈值:占上下文的比例。留出余量给本轮提问与模型回答,
+  // 因为压缩本身要花时间,卡太紧会出现"刚要压缩却已经溢出"。
+  thresholdRatio: 0.6,
+  // 至少保留最近几轮原文,保证近期对话不失真
+  keepRecentTurns: 4,
+  // 压缩后的摘要最多保留多少 token
+  summaryMaxTokens: 800,
+  // 统计
+  compressCount: 0,
+  lastCompressAt: null,
+  lastReason: null,
+}
+
+function loadState() {
+  try {
+    const saved = JSON.parse(readFileSync(STATE_FILE, 'utf8'))
+    if (typeof saved.enabled === 'boolean') state.enabled = saved.enabled
+    if (typeof saved.thresholdRatio === 'number') state.thresholdRatio = saved.thresholdRatio
+    if (Number.isInteger(saved.keepRecentTurns)) state.keepRecentTurns = saved.keepRecentTurns
+  } catch { /* 首次运行没有状态文件 */ }
+}
+function saveState() {
+  try {
+    writeFileSync(STATE_FILE, JSON.stringify({
+      enabled: state.enabled,
+      thresholdRatio: state.thresholdRatio,
+      keepRecentTurns: state.keepRecentTurns,
+    }, null, 2), 'utf8')
+  } catch { /* 保存失败不影响运行 */ }
+}
+loadState()
+
+// ------------------------------------------------------------------ token 估算
+
+/**
+ * 估算一段文本的 token 数。
+ *
+ * 实测(见 tools/probe_tokenize.mjs):
+ *   中文约 1.7 字符/token,英文约 3.2 字符/token
+ * 所以按"每个字符最多贡献多少 token"取上界:中文最紧,约 0.59 token/字符。
+ * 这里用 0.6 作为保守上界 —— 宁可高估(早点压缩),不要低估(溢出)。
+ */
+function estimateTokens(text) {
+  if (!text) return 0
+  return Math.ceil(String(text).length * 0.6)
+}
+
+function estimateMessagesTokens(messages) {
+  let n = 0
+  for (const m of messages) {
+    n += estimateTokens(m.content) + 4   // 每条消息的固定开销
+  }
+  return n + 8                            // 模板本身的开销
+}
+
+// ------------------------------------------------------------------ 与上游通信
+
+/** 读取上游 /props,拿到真实的 n_ctx。缓存一份,失败时用兜底值。 */
+let ctxCache = { value: null, at: 0 }
+async function getContextSize() {
+  if (ctxCache.value && Date.now() - ctxCache.at < 60000) return ctxCache.value
+  try {
+    const r = await fetch(`${UPSTREAM}/props`, { signal: AbortSignal.timeout(8000) })
+    const j = await r.json()
+    const n = j.default_generation_settings?.n_ctx
+    if (Number.isInteger(n) && n > 0) {
+      ctxCache = { value: n, at: Date.now() }
+      return n
+    }
+  } catch { /* 上游没起来 */ }
+  log('警告:拿不到上游 n_ctx,暂用 65536 兜底')
+  return ctxCache.value || 65536
+}
+
+/** 调上游做一次非流式补全(压缩时总结用)。 */
+async function upstreamComplete(messages, maxTokens) {
+  const r = await fetch(`${UPSTREAM}/v1/chat/completions`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'local',
+      messages,
+      max_tokens: maxTokens,
+      stream: false,
+      // 总结任务不需要思考,关掉它。
+      //
+      // 注意:这里标 reasoning_budget:0 是"顺手明确意图",**不是**性能关键。
+      // 曾经误以为它把总结从 35s 降到 3s,后来用连发三次的对照实验证明:
+      // 真正的差异来自**首次请求预热**(模型加载后第一次推理要建 CUDA 图、
+      // 分配 KV cache,约 32s),第二次起就只要 0.8-2.9s。
+      // 教训:同一进程里先后跑多个配置,后者天然更快,很容易把预热误当成
+      // 参数效果 —— 对比时必须重复或打乱顺序。
+      chat_template_kwargs: { enable_thinking: false },
+      reasoning_budget: 0,
+    }),
+    signal: AbortSignal.timeout(300000),
+  })
+  if (!r.ok) throw new Error(`上游 HTTP ${r.status}`)
+  const j = await r.json()
+  const msg = j.choices?.[0]?.message || {}
+  // 只要最终答案,丢掉思考内容
+  return (msg.content || '').trim()
+}
+
+// ------------------------------------------------------------------ 压缩逻辑
+
+/**
+ * 需要压缩时,把较早的对话总结成一段,替换掉原文。
+ *
+ * 结构:保留 system 提示 → 插入一条"前情提要" → 保留最近 N 轮原文。
+ * 摘要作为 system 消息插入,而不是伪装成用户发言,避免污染对话结构。
+ */
+async function maybeCompress(messages) {
+  if (!state.enabled) return { messages, compressed: false }
+
+  const nCtx = await getContextSize()
+  const budget = Math.floor(nCtx * state.thresholdRatio)
+  const used = estimateMessagesTokens(messages)
+
+  if (used <= budget) {
+    return { messages, compressed: false, used, budget, nCtx }
+  }
+
+  // 至少要有 system + 若干轮才值得压缩
+  const SYSTEMS = messages.filter((m) => m.role === 'system')
+  const convo = messages.filter((m) => m.role !== 'system')
+
+  // 保留最近 keepRecentTurns 轮(一轮≈提问+回答两条)
+  const keepCount = state.keepRecentTurns * 2
+  if (convo.length <= keepCount + 2) {
+    log(`历史超预算但条数不足以压缩(共 ${convo.length} 条),本轮不做压缩`)
+    return { messages, compressed: false, used, budget, nCtx }
+  }
+
+  const older = convo.slice(0, convo.length - keepCount)
+  const recent = convo.slice(convo.length - keepCount)
+
+  log(`触发压缩:估算 ${used} token > 预算 ${budget}(上下文 ${nCtx})`)
+  log(`  将总结较早的 ${older.length} 条,保留最近 ${recent.length} 条原文`)
+
+  // 把待总结的对话铺成纯文本。注意丢掉 reasoning —— 思考内容对"前情"没用,
+  // 留着只会让摘要更啰嗦。
+  const transcript = older
+    .map((m) => {
+      const who = m.role === 'user' ? '用户' : '助手'
+      return `${who}:${String(m.content || '').slice(0, 2000)}`
+    })
+    .join('\n')
+
+  const t0 = Date.now()
+  let summary = ''
+  try {
+    summary = await upstreamComplete([
+      {
+        role: 'system',
+        content: '你是对话摘要器。把下面的对话压缩成简洁的中文要点,保留:用户的目标、已确认的事实与结论、待办事项、以及重要的具体数值或名称。不要加入新信息,不要评论,直接输出要点。',
+      },
+      { role: 'user', content: transcript },
+    ], state.summaryMaxTokens)
+    state.lastSummaryMs = Date.now() - t0
+  } catch (e) {
+    // 压缩失败不能让整轮对话失败 —— 退化成本轮不压缩,让上游按原样处理
+    log(`压缩失败(${e.message}),本轮按原文发送`)
+    return { messages, compressed: false, used, budget, nCtx, error: e.message }
+  }
+
+  if (!summary) {
+    log('压缩返回空内容,本轮按原文发送')
+    return { messages, compressed: false, used, budget, nCtx }
+  }
+
+  const brief = '以下是此前对话的摘要(较早的内容已被压缩):\n\n' + summary
+
+  // 关键:模型的聊天模板要求 **system 消息必须位于最前**,而且通常只允许
+  // 一条。所以不能简单地在原 system 之后插入一条新的 system —— 那会直接
+  // 报 "System message must be at the beginning"(实测踩过)。
+  // 正确做法是把摘要**并入**原有 system 内容。
+  const mergedSystem = {
+    role: 'system',
+    content: SYSTEMS.length
+      ? `${SYSTEMS.map((m) => m.content).join('\n\n')}\n\n${brief}`
+      : brief,
+  }
+  const next = [mergedSystem, ...recent]
+
+  const newUsed = estimateMessagesTokens(next)
+  state.compressCount++
+  state.lastCompressAt = new Date().toISOString()
+  state.lastReason = `${used} -> ${newUsed} token`
+
+  log(`  压缩完成:${older.length} 条 -> 摘要 ${summary.length} 字`)
+  log(`  估算 token:${used} -> ${newUsed},总结耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`)
+  return { messages: next, compressed: true, used, budget, nCtx, newUsed, summary }
+}
+
+// ------------------------------------------------------------------ 请求转发
+
+/** 把上游响应原样回给客户端(支持流式)。 */
+async function pipeResponse(upstreamRes, res) {
+  const headers = {}
+  for (const [k, v] of upstreamRes.headers) {
+    // 去掉会与实际内容不符的头:长度可能变了,编码也已由 fetch 解开
+    if (['content-length', 'content-encoding', 'transfer-encoding'].includes(k.toLowerCase())) continue
+    headers[k] = v
+  }
+  res.writeHead(upstreamRes.status, headers)
+  if (!upstreamRes.body) { res.end(); return }
+  const reader = upstreamRes.body.getReader()
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    res.write(Buffer.from(value))
+  }
+  res.end()
+}
+
+/** 读取请求体。 */
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    req.on('data', (c) => chunks.push(c))
+    req.on('end', () => resolve(Buffer.concat(chunks)))
+    req.on('error', reject)
+  })
+}
+
+const server = http.createServer(async (req, res) => {
+  // ---- 控制接口:手机/浏览器上开关压缩 ----
+  if (req.url === '/_bridge/status' || req.url === '/_bridge/config') {
+    if (req.method === 'GET') {
+      let nCtx = null
+      try { nCtx = await getContextSize() } catch { /* 上游可能没起来 */ }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' })
+      res.end(JSON.stringify({
+        compression: {
+          enabled: state.enabled,
+          thresholdRatio: state.thresholdRatio,
+          keepRecentTurns: state.keepRecentTurns,
+          summaryMaxTokens: state.summaryMaxTokens,
+        },
+        context: { nCtx, triggerAt: nCtx ? Math.floor(nCtx * state.thresholdRatio) : null },
+        stats: { compressCount: state.compressCount, lastCompressAt: state.lastCompressAt, lastReason: state.lastReason },
+        upstream: UPSTREAM,
+      }, null, 2))
+      return
+    }
+    if (req.method === 'POST') {
+      try {
+        const patch = JSON.parse((await readBody(req)).toString('utf8') || '{}')
+        if (typeof patch.enabled === 'boolean') state.enabled = patch.enabled
+        if (typeof patch.thresholdRatio === 'number' && patch.thresholdRatio > 0.1 && patch.thresholdRatio < 0.95) {
+          state.thresholdRatio = patch.thresholdRatio
+        }
+        if (Number.isInteger(patch.keepRecentTurns) && patch.keepRecentTurns >= 1 && patch.keepRecentTurns <= 20) {
+          state.keepRecentTurns = patch.keepRecentTurns
+        }
+        saveState()
+        log(`配置已更新: 压缩=${state.enabled ? '开' : '关'} 阈值=${state.thresholdRatio} 保留${state.keepRecentTurns}轮`)
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Access-Control-Allow-Origin': '*' })
+        res.end(JSON.stringify({ ok: true, compression: { enabled: state.enabled, thresholdRatio: state.thresholdRatio, keepRecentTurns: state.keepRecentTurns } }))
+      } catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ ok: false, error: e.message }))
+      }
+      return
+    }
+    res.writeHead(405); res.end('method not allowed')
+    return
+  }
+
+  // ---- 核心:拦截对话补全,做压缩 ----
+  const isChat = req.url === '/v1/chat/completions' && req.method === 'POST'
+
+  if (isChat) {
+    let body
+    try {
+      body = JSON.parse((await readBody(req)).toString('utf8') || '{}')
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ error: { message: 'invalid JSON' } }))
+      return
+    }
+
+    if (Array.isArray(body.messages)) {
+      try {
+        const r = await maybeCompress(body.messages)
+        if (r.compressed) {
+          body.messages = r.messages
+          // 摘要变长了,原本的 max_tokens 可能不合适;保持不变由上游决定
+        }
+      } catch (e) {
+        log(`压缩阶段异常(${e.message}),按原文转发`)
+      }
+    }
+
+    const upstreamRes = await forward(JSON.stringify(body), req, res)
+    if (upstreamRes) await pipeResponse(upstreamRes, res)
+    return
+  }
+
+  // ---- 其余一律透明转发 ----
+  const buf = ['GET', 'HEAD'].includes(req.method) ? undefined : await readBody(req)
+  const upstreamRes = await forward(buf, req, res)
+  if (upstreamRes) await pipeResponse(upstreamRes, res)
+})
+
+/** 向发上游发一次请求。出错时直接给客户端一个 502。 */
+async function forward(buf, req, res) {
+  const headers = {}
+  for (const [k, v] of Object.entries(req.headers)) {
+    if (['host', 'connection', 'content-length', 'accept-encoding'].includes(k.toLowerCase())) continue
+    headers[k] = v
+  }
+  headers.host = UPSTREAM_URL.host
+  if (buf) headers['content-length'] = String(Buffer.byteLength(buf))
+
+  try {
+    return await fetch(`${UPSTREAM}${req.url}`, {
+      method: req.method,
+      headers,
+      body: buf,
+      // 模型推理可能很久,不设总超时;连接阶段有默认保护
+      signal: AbortSignal.timeout(600000),
+    })
+  } catch (e) {
+    const msg = e.cause ? (e.cause.code || e.cause.message) : e.message
+    log(`转发失败 ${req.method} ${req.url}: ${msg}`)
+    if (!res.headersSent) {
+      res.writeHead(502, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ error: { message: `连不上上游 ${UPSTREAM}:${msg}`, type: 'upstream_unreachable' } }))
+    }
+    return null
+  }
+}
+
+server.listen(PROXY_PORT, '0.0.0.0', () => {
+  log('=== 上下文压缩代理已启动 ===')
+  log(`  监听: http://0.0.0.0:${PROXY_PORT}  (手机连这个)`)
+  log(`  上游: ${UPSTREAM}`)
+  log(`  压缩: ${state.enabled ? '开启' : '关闭'}  阈值: 上下文的 ${state.thresholdRatio}`)
+  log(`  保留最近 ${state.keepRecentTurns} 轮原文`)
+  log(`  状态/开关: GET|POST http://127.0.0.1:${PROXY_PORT}/_bridge/status`)
+  log('')
+  log('提示:模型加载后的**第一次**对话会明显偏慢(约 30 秒量级),')
+  log('      那是 CUDA 图初始化与 KV cache 分配的开销,与压缩无关 ——')
+  log('      实测同一请求连发三次:32.5s / 1.3s / 0.8s。第二次起就正常了。')
+})
