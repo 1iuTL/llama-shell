@@ -32,7 +32,16 @@ const PROXY_PORT = Number(process.env.PROXY_PORT || 8092)
 const UPSTREAM = process.env.UPSTREAM || 'http://127.0.0.1:8091'
 const UPSTREAM_URL = new URL(UPSTREAM)
 
-const LOG_DIR = 'C:\\deepseek harness\\model-stove\\logs'
+// 日志与状态文件的位置。
+//
+// PROXY_STATE_DIR 是给测试用的隔离开关。为什么需要它:
+// tools/test_proxy.mjs 会把阈值临时调到 0.2 来方便触发压缩,而它写的是
+// **同一个** state 文件 —— 于是测试一跑,生产的压缩配置就被改成
+// "阈值 0.2、保留 2 轮"并且**不会还原**。实测就这么被污染过:
+// 界面显示压缩阈值 0.2,而代码默认是 0.6,查了半天才发现是测试干的。
+//
+// 测试必须能把状态写到别处,不能有"跑个测试顺手改了用户配置"这种事。
+const LOG_DIR = process.env.PROXY_STATE_DIR || 'C:\\deepseek harness\\model-stove\\logs'
 if (!existsSync(LOG_DIR)) mkdirSync(LOG_DIR, { recursive: true })
 const LOG_FILE = `${LOG_DIR}\\context-proxy.log`
 const STATE_FILE = `${LOG_DIR}\\context-proxy-state.json`
@@ -51,11 +60,17 @@ function log(...args) {
  */
 const state = {
   enabled: process.env.COMPRESS !== '0',
-  // 触发阈值:占上下文的比例。留出余量给本轮提问与模型回答,
-  // 因为压缩本身要花时间,卡太紧会出现"刚要压缩却已经溢出"。
-  thresholdRatio: 0.6,
-  // 至少保留最近几轮原文,保证近期对话不失真
-  keepRecentTurns: 4,
+  // 触发阈值:占上下文的比例。
+  //
+  // 75% 是权衡出来的:低一点(比如 60%)会压缩得太频繁 —— 每次压缩都要让模型
+  // 读一遍旧对话再写摘要,既花时间又容易把还有用的细节抹掉;高一点则风险在于
+  // 压缩本身要花时间,卡到 90% 以上可能出现"刚要压缩却已经溢出"。
+  //
+  // 32K 上下文下 75% ≈ 24576 token 触发,留给本轮提问和回答约 8K,够用。
+  thresholdRatio: 0.75,
+  // 至少保留最近几轮原文,保证近期对话不失真。
+  // 取 6 而不是 4:压缩最怕的不是"留太多",而是把还有用的细节抹掉。
+  keepRecentTurns: 6,
   // 压缩后的摘要最多保留多少 token
   summaryMaxTokens: 800,
   // 当前任务档位。见 src/profiles.js —— 它决定采样参数与是否开思考。

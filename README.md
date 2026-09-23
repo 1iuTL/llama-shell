@@ -472,7 +472,7 @@ POST http://<电脑IP>:8092/_bridge/config   {"enabled":true}
 POST http://<电脑IP>:8092/_bridge/config   {"profile":"write"}
 ```
 
-压缩默认**开启**,阈值是上下文的 60%,保留最近 4 轮原文。
+压缩默认**开启**,阈值是上下文的 **75%**,保留最近 **6** 轮原文。
 
 ### 为什么要另起端口:localStorage 按地址隔离
 

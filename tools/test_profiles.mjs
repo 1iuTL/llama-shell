@@ -27,7 +27,9 @@ const PROXY = 'http://127.0.0.1:8092'
 const pxLog = openSync(`${TMP}\\proxy.log`, 'w')
 const proxy = spawn(process.execPath, [`${APP}\\context-proxy.mjs`], {
   cwd: APP,
-  env: { ...process.env, PROXY_PORT: '8092' },
+  env: { ...process.env, PROXY_PORT: '8092' ,
+    // 状态写到测试自己的临时目录,别碰生产的 context-proxy-state.json
+    PROXY_STATE_DIR: TMP},
   stdio: ['ignore', pxLog, pxLog],
   windowsHide: true,
 })

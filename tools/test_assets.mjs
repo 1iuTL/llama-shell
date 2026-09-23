@@ -48,7 +48,9 @@ console.log('启动代理...')
 const pxOut = openSync(`${TMP}\\proxy.log`, 'w')
 const proxy = spawn(process.execPath, [`${APP}\\context-proxy.mjs`], {
   cwd: APP,
-  env: { ...process.env, PROXY_PORT: String(PX), UPSTREAM: `http://127.0.0.1:${DIR}` },
+  env: { ...process.env, PROXY_PORT: String(PX),
+    // 状态写到测试自己的临时目录,别碰生产的 context-proxy-state.json
+    PROXY_STATE_DIR: TMP, UPSTREAM: `http://127.0.0.1:${DIR}` },
   stdio: ['ignore', pxOut, pxOut],
   windowsHide: true,
 })

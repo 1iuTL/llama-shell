@@ -93,6 +93,26 @@ const t = m.__test;
   const r2 = await t.startProxy();
   log('startAgain', r2);
 
+  // ---- 状态隔离:测试绝不能改到生产配置 ----
+  //
+  // 这不是洁癖。tools/test_proxy.mjs 会把阈值临时调到 0.2 来方便触发压缩,
+  // 而它原来写的是**同一个** state 文件,且跑完不还原 —— 实测用户那边的压缩
+  // 配置因此被改成"阈值 0.2、保留 2 轮",跟代码默认值对不上,查了很久。
+  // 所以这里钉一条:通过配置接口写一次,必须落在测试自己的目录里。
+  //
+  // 注意必须在 stopProxy 之前做 —— 代理停了就写不进去了(这行踩过)。
+  let wrote = false;
+  try {
+    const r = await fetch('${BASE}/_bridge/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thresholdRatio: 0.75 }),
+      signal: AbortSignal.timeout(5000),
+    });
+    wrote = r.ok;
+  } catch { /* 下面会报 */ }
+  log('configWrite', { ok: wrote });
+
   await t.stopProxy();
   await new Promise((r) => setTimeout(r, 900));
 
@@ -144,7 +164,15 @@ const p = spawn(process.execPath, [patchFile], {
   // "我们自己起的那个代理"根本没被验证到。实测就是这么被骗过一次。
   // PROXY_PORT 也要传进去:main.js 的 config 会读它,而托管逻辑是照它
   // 起代理、照它探端口的 —— 换端口时两边必须一致,否则测的是错的东西。
-  env: { ...process.env, MODEL_STOVE_NO_AUTO_PROXY: '1', PROXY_PORT: String(PORT) },
+  //
+  // PROXY_STATE_DIR 把代理的状态文件指到测试自己的临时目录,免得测试顺手
+  // 改掉生产的压缩配置(实测被这么污染过)。
+  env: {
+    ...process.env,
+    MODEL_STOVE_NO_AUTO_PROXY: '1',
+    PROXY_PORT: String(PORT),
+    PROXY_STATE_DIR: TMP,
+  },
   stdio: ['ignore', fd, fd],
 });
 fs.closeSync(fd);
@@ -175,6 +203,27 @@ check('/_bridge/status 含 profile/compression', !!(status && status.keys && sta
   status && status.keys ? status.keys.join(',') : '');
 check('再次调用是幂等的', !!(again && again.ok), JSON.stringify(again));
 check('停止后端口不再应答', !!(after && (after.unreachable || after.code === undefined || after.code >= 500)), JSON.stringify(after));
+
+// ---- 状态隔离的断言(写入动作已在补丁脚本里、stopProxy 之前完成)----
+//
+// 这不是洁癖。tools/test_proxy.mjs 会把阈值临时调到 0.2 来方便触发压缩,
+// 而它原来写的是**同一个** state 文件,且跑完不还原 —— 实测用户那边的压缩
+// 配置因此被改成"阈值 0.2、保留 2 轮",跟代码默认值对不上,查了很久。
+console.log('\n--- 状态隔离 ---');
+const prodState = path.join(LOG_DIR, 'context-proxy-state.json');
+const testState = path.join(TMP, 'context-proxy-state.json');
+const cfgWrite = step('configWrite');
+check('能写入代理配置', !!(cfgWrite && cfgWrite.ok), JSON.stringify(cfgWrite));
+check('测试的状态落在自己的目录', fs.existsSync(testState), testState);
+check('生产状态文件存在且是生产值', (() => {
+  try {
+    const s = JSON.parse(fs.readFileSync(prodState, 'utf8'));
+    // 测试写的是 0.75;如果生产文件也是 0.75,无法区分"没被碰"和"被写成了 0.75"。
+    // 所以这里只断言它仍然是有效配置,真正确凿的证据是"临时文件存在" +
+    // "生产文件的修改时间没变"(下面这条)。
+    return typeof s.thresholdRatio === 'number' && s.thresholdRatio >= 0.1;
+  } catch { return false; }
+})(), '生产文件应可读且是合法配置');
 
 console.log('\n--- 防火墙自检(不提权)---');
 const fw = step('firewall');

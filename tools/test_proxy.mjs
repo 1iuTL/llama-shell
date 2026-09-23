@@ -45,6 +45,12 @@ const proxy = spawn(process.execPath, [`${SRC}\\context-proxy.mjs`], {
     PROXY_PORT: String(PROXY_PORT),
     UPSTREAM: `http://127.0.0.1:${MODEL_PORT}`,
     COMPRESS: '1',
+    // 把状态写到测试自己的临时目录。
+    //
+    // 不隔离的话这个测试会改**生产**状态文件:下面它把阈值调到 0.2、
+    // 保留 2 轮,而且跑完不还原 —— 实测用户那边的压缩配置就这么被改成了
+    // 0.2 / 2 轮,界面显示的默认值(0.6 / 4)对不上,查了很久。
+    PROXY_STATE_DIR: TMP,
   },
   stdio: ['ignore', pxOut, pxOut],
   windowsHide: true,
