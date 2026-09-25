@@ -1053,7 +1053,27 @@ function launchFirewallHelper() {
 
 // ------------------------------------------------------------------ 生命周期
 
+// 单实例保护。没有它的时候,双击两次图标(或启动器多试一档)会起两个实例抢同一个
+// Chromium profile:表现是"关掉又自己冒出来一个",日志里则是 Cache 报
+// "Unable to move the cache"。拿到锁的实例正常跑;第二个实例只把已有窗口提到
+// 前面,然后自己退出。
+const gotTheLock = typeof app.requestSingleInstanceLock === 'function'
+  ? app.requestSingleInstanceLock()
+  : true;   // 测试用的 electron 桩没有这个方法,那时按"拿到锁"处理
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (win) {
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    }
+  });
+}
+
 app.whenReady().then(async () => {
+  if (!gotTheLock) return;   // 第二个实例:不建窗口、不起服务,直接退出
   // 设置放在 userData 下:更新外壳不会把它冲掉,也不会跟着仓库被提交。
   // MODEL_STOVE_SETTINGS_DIR 是测试用的覆盖开关 —— 自动化测试需要一个
   // 可写、可丢弃的位置,不能去动用户真实的 %APPDATA% 设置。

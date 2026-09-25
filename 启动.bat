@@ -1,31 +1,29 @@
 @echo off
+setlocal
 REM model-stove launcher.
-REM Uses an absolute path to electron.exe: a relative "." breaks when the
-REM working directory is not honoured, and the space in "deepseek harness"
-REM truncates an unquoted path.
-
-set ELECTRON="C:\deepseek harness\dsh-desktop\node_modules\electron\dist\electron.exe"
-set APP="C:\deepseek harness\model-stove"
-
+REM
+REM 两点说明:
+REM 1) 用 %CD% 拼绝对路径,而不是 "." —— 这个目录名里有空格,
+REM    未加引号会被截断,相对路径也会在"工作目录没被尊重"时失效。
+REM 2) --no-sandbox:这台机器上 Chromium 自己的沙箱初始化会失败,electron 会
+REM    在几百毫秒内秒退(退出码 0x80000003)且不给任何提示。加上它才能启动。
+REM    诊断记录见 logs\launcher.log。
+cd /d "%~dp0"
+set ELECTRON="%CD%\node_modules\electron\dist\electron.exe"
 if not exist %ELECTRON% (
   echo.
-  echo [ERROR] electron.exe not found at:
-  echo   C:\deepseek harness\dsh-desktop\node_modules\electron\dist\electron.exe
-  echo.
-  echo Fix: run  npm install  inside model-stove  ^(needs an electron 43.x^),
-  echo      or point ELECTRON above at another Electron install.
+  echo [ERROR] electron.exe 不在 %CD%\node_modules\electron\dist\
+  echo   修复: 在 %CD% 下执行  npm install
   echo.
   pause
   exit /b 1
 )
-
-if not exist %APP%\src\main.js (
-  echo [ERROR] model-stove sources missing at %APP%
+if not exist "%CD%\src\main.js" (
+  echo [ERROR] 源码缺失: %CD%\src\main.js
   pause
   exit /b 1
 )
-
-%ELECTRON% %APP%
+%ELECTRON% --no-sandbox "%CD%"
 if errorlevel 1 (
   echo.
   echo [model-stove exited with code %errorlevel%]
