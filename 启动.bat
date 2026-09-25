@@ -2,24 +2,25 @@
 setlocal
 REM model-stove launcher.
 REM
-REM 两点说明:
-REM 1) 用 %CD% 拼绝对路径,而不是 "." —— 这个目录名里有空格,
-REM    未加引号会被截断,相对路径也会在"工作目录没被尊重"时失效。
-REM 2) --no-sandbox:这台机器上 Chromium 自己的沙箱初始化会失败,electron 会
-REM    在几百毫秒内秒退(退出码 0x80000003)且不给任何提示。加上它才能启动。
-REM    诊断记录见 logs\launcher.log。
+REM Two notes:
+REM 1) Build the absolute path from %CD% instead of "." -- this directory name
+REM    contains spaces, so an unquoted path gets truncated, and a relative path
+REM    also breaks when the working directory is not respected.
+REM 2) --no-sandbox: on this machine Chromium own sandbox init fails and
+REM    electron exits within a few hundred ms (code 0x80000003) with no message.
+REM    The flag is required to start. See logs\launcher.log.
 cd /d "%~dp0"
 set ELECTRON="%CD%\node_modules\electron\dist\electron.exe"
 if not exist %ELECTRON% (
   echo.
-  echo [ERROR] electron.exe 不在 %CD%\node_modules\electron\dist\
-  echo   修复: 在 %CD% 下执行  npm install
+  echo [ERROR] electron.exe not found in %CD%\node_modules\electron\dist\
+  echo   fix: run  npm install  inside %CD%
   echo.
   pause
   exit /b 1
 )
 if not exist "%CD%\src\main.js" (
-  echo [ERROR] 源码缺失: %CD%\src\main.js
+  echo [ERROR] missing source: %CD%\src\main.js
   pause
   exit /b 1
 )
