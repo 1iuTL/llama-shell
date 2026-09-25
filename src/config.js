@@ -176,52 +176,14 @@ const MODELS = [
     defaultPreset: 'text-64k',
   },
 
-  // ---- mmq 构建的「快速加载」版本(2026-09-25 新增) ----
-  //
-  // 同一份权重、同一套参数,只是把二进制换成 llama-cpp-mmq 构建。实测:
-  //   「threadpool init -> 权重就位」19.2 秒  ->  2.5 秒
-  //   总加载时间                    24 秒  ->  约 7 秒
-  //
-  // 现象确凿,机理是推测:prism 构建在这一段要在 CPU 侧处理量化权重(单线程),
-  // 期间 GPU 全程空闲(P8/285MHz),PCIe 链路还会自己降档到 Gen1 —— 之前以为的
-  // "显卡/PCIe 硬件问题"其实只是这个处理过程造成的现象。mmq 构建不做这一步,
-  // 所以快了 6 倍(是否就是 MMQ 内核的差别,没有逐行验证)。
-  //
-  // 三组提示(中文常识/英文事实/算术)实测两个构建回答一致;但上面的注释提到
-  // Bonsai 2 需要特定 fork 的 Hadamard 变换,那是**正确性**层面的问题,不是加载。
-  // 因此原条目全部保留:如果发现质量异常,直接切回官方构建条目即可。
-  {
-    id: 'onbit-mmq',
-    name: 'Bonsai 27B 1-bit · mmq 快速加载',
-    note: 'Q1_0 · 3.54 GB · 加载约 6 秒(官方构建约 24 秒)',
-    file: MODELS_DIR + 'Bonsai-27B-Q1_0.gguf',
-    bin: BIN.fast,
-    defaultPreset: 'text-64k',
-  },
-  {
-    id: 'ternary-mmq',
-    name: 'Bonsai 2 27B 三元版 · mmq 快速加载',
-    note: 'PTQ1_0 · 5.54 GB · 加载约 7 秒(官方构建约 24 秒)',
-    file: MODELS_DIR + 'Ternary-Bonsai-2-27B-PTQ1_0.gguf',
-    bin: BIN.fast,
-    defaultPreset: 'text-64k',
-  },
-  {
-    id: 'ternary-heretic-mmq',
-    name: '三元版 · 去审查(Heretic) · mmq 快速加载',
-    note: 'PTQ1_0 · 5.54 GB · 加载约 7 秒,拒答率低',
-    file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Heretic-PTQ1_0.gguf',
-    bin: BIN.fast,
-    defaultPreset: 'text-64k',
-  },
-  {
-    id: 'ternary-abliterated-mmq',
-    name: '三元版 · 去审查(Abliterated) · mmq 快速加载',
-    note: 'PTQ1_0 · 5.54 GB · 加载约 7 秒,实测零拒答',
-    file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf',
-    bin: BIN.fast,
-    defaultPreset: 'text-64k',
-  },
+
+  // 【警告】不要给 Bonsai 2(PTQ1_0)添加任何「更快的构建」条目。
+  // 社区 fork(sudoingX/llama.cpp 的 pr-ptq1-mmv,即 BIN.fast / llama-cpp-mmq)虽然
+  // 加载只要 2.5 秒(官方构建要 19 秒)、预填充还快一倍,但对 Bonsai 2 会【稳定塌缩】:
+  // 实测最长连续重复 657~708 个字符,输出整片是斜杠。
+  // README「fork 与 gguf 必须配对」一节有完整实测表。
+  // 那 19 秒加载是官方构建为 Hadamard 激活变换付出的代价,没有捷径。
+  // BIN.fast 保留仅供参考,不要挂到任何三元模型上。
 ];
 
 /**
