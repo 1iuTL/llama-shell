@@ -740,3 +740,41 @@ token 只能从环境变量传进来,不能让脚本自己去 `git credential-ma
 ## 许可
 
 MIT
+
+---
+
+## 启动链说明（2026-09-25 实测记录）
+
+这台机器上踩过三个坑，改动都留在这里，别改回去：
+
+1. **`electron` 在标准句柄为空时会瞬间退出**（退出码 `0x80000003`，不打印任何东西、不弹框）。
+   Explorer 启动快捷方式时句柄就是空的 —— 所以**不能再用"桌面快捷方式直连 electron.exe"**。
+   正确做法：用 `tools/launcher` 编译出的 `Model Stove.exe` 启动，它把 electron 的
+   stdout/stderr 接到管道上（有效句柄），并在后台陪着 electron，应用关掉后自己退出。
+   构建：`tools\launcher\build.cmd <应用根目录>`
+2. **本机 Chromium 内部沙箱初始化会失败**，表现与第 1 条相同 → 启动器固定加 `--no-sandbox`。
+3. **批处理必须是 CRLF 换行**：`启动.bat`、`tools\allow-lan.cmd` 曾经是 LF，cmd 下双击不执行。
+   另外 `启动.bat` 已改为自包含（调用本仓库自己的 `node_modules\electron`，不再依赖
+   dsh-desktop 的 `node_modules`）。
+
+`src/main.js` 另外加了**单实例保护**：重复启动不再开第二个窗口，而是把已有窗口提到前面
+（此前会出现"关掉又自己冒出来一个"，以及 Chromium 缓存报 `Unable to move the cache`）。
+
+## 模型加载变慢：已定位为硬件/固件层面的 PCIe 问题（与本软件无关）
+
+**现象**：加载 5.5 GB 模型时，`threadpool init → 权重就位` 这一段从 **0.55 s** 变成 **~19 s**。
+
+**证据**：
+- 绕开本软件、直接运行 `llama-server.exe`（同一套参数），复现**完全相同的 19 s**；
+- 加载中每秒采样：显存 **4 秒内就填到 6.5 GB**（上传本身很快），随后 GPU 在
+  **P8 / 285 MHz / 0% / 4~6 W 上空转 18 秒**，然后突然跳 P0 并立刻 `listening on`；
+- 系统日志出现 `WHEA-Logger` 事件 17：**组件 = PCI Express Root Port、
+  错误源 = Advanced Error Reporting (PCIe)**（Intel 根端口 `00:06.3`，即显卡所在链路）；
+- `nvidia-smi`：显卡链路由 **Gen5 ×16 降到 Gen4 ×8**。
+
+⇒ 那 19 秒是在等 **PCIe 链路做错误恢复/重训**，不是带宽、不是模型大小、也不是应用。
+换更小的模型同样慢（停顿是每次链路事件，不按数据量算）。
+
+**处理方向**：关闭 Windows 电源计划里的 PCIe 链路状态电源管理（ASPM）；
+NVIDIA 控制面板 → 电源管理模式=优先最大性能、CUDA 系统内存回退策略=不使用；
+更新显卡驱动/BIOS/芯片组；若 WHEA 事件仍持续出现，应做硬件检测（保修）。
