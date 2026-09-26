@@ -16,7 +16,8 @@ const path = require('path');
 const http = require('http');
 const net = require('net');
 
-const { MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET, buildArgs, PROXY_PORT, PROXY_BASE } = require('./config');
+const { MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET, buildArgs, PROXY_PORT, PROXY_BASE, CTX_STEPS, VRAM_CEILING_MIB, KV_TYPES, DEFAULT_KV, safeCtxFor, resolveKv } = require('./config');
+const { probeSpeed } = require('./probe');
 const settings = require('./settings');
 
 const PORT = 8091;
@@ -28,7 +29,7 @@ const PROXY_SCRIPT = path.join(REPO_ROOT, 'context-proxy.mjs');
 let win = null;
 let child = null;
 // 未运行时的状态。收成一个常量,免得三处各写一份、改漏一处。
-const EMPTY_CURRENT = { modelId: null, preset: null, reasoning: null, budget: null, lanMode: false, startedAt: null };
+const EMPTY_CURRENT = { modelId: null, preset: null, reasoning: null, budget: null, ctx: null, kv: null, speed: null, lanMode: false, startedAt: null };
 let current = { ...EMPTY_CURRENT };
 let logFile = null;
 
@@ -85,6 +86,35 @@ function modelExists(model) {
 
 function binExists(model) {
   try { return fs.existsSync(model.bin); } catch { return false; }
+}
+
+// ------------------------------------------------------------ 启动速度探针
+//
+// 实现搬到了 src/probe.js —— 那边不依赖 electron,可以被真实服务器测到。
+// 这里只负责"什么时候跑、结果放哪、界面怎么知道"。
+//
+// 探针跑在后台,不阻塞 startServer() 返回:界面先显示"运行中",几秒后状态栏
+// 再补上速度与结论。探测期间会占用那唯一的槽位(-np 1),但用户的第一条消息
+// 本来也要付这次 CUDA 图构建的钱,所以净成本是零。
+//
+// 用户可以在设置里关掉(settings.probe === false)。
+function runProbe(model) {
+  const s = settings.readSettings();
+  if (s.probe === false) return;
+  current.speed = { pending: true };
+  notifyRenderer();
+  probeSpeed(BASE, model, { alive: () => !!child })
+    .then((res) => {
+      if (!child) return;                       // 服务已经停了,别乱写状态
+      current.speed = res || { failed: true };
+      try {
+        fs.appendFileSync(logFile,
+          `[shell] 速度探针:${res ? res.tps + ' tok/s (基线 ' + res.expected +
+            (res.spilled ? ',判定溢出)' : ',正常)') : '未取得结果'}\n`);
+      } catch {}
+      notifyRenderer();
+    })
+    .catch(() => { if (child) { current.speed = { failed: true }; notifyRenderer(); } });
 }
 
 /**
@@ -291,8 +321,12 @@ function killLeftoverServers() {
 /** 拉起服务并等它就绪。
  *  reasoningKey 为 null/空时**不传** --reasoning-effort,由模型模板或界面自行决定。
  *  lanMode 为 true 时监听 0.0.0.0,手机等其它设备才能连上。
- *  apiKey 从本地设置里读,非空则加 --api-key 给所有接口上锁。 */
-async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey) {
+ *  apiKey 从本地设置里读,非空则加 --api-key 给所有接口上锁。
+ *  ctx 是上下文滑块的取值(token)。null/空 => 用预设自带的 ctx。
+ *  kv 是 KV cache 精度键名('q4_0' / 'q8_0'),非法值回落到默认。
+ *  两者的合法性都由 config.js 的 buildArgs() 统一裁决 —— 界面只是提出意向,
+ *  不做为最终决定,免得"漏校验一次 = 静默慢 8 倍"。 */
+async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey, ctx, kv) {
   await stopServer();
 
   const model = MODELS.find((m) => m.id === modelId);
@@ -304,7 +338,7 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey)
   killLeftoverServers();
 
   const apiKey = (settings.readSettings().apiKey || '').trim();
-  const args = buildArgs(model, presetKey, PORT, reasoningKey, lanMode, apiKey, budgetKey);
+  const args = buildArgs(model, presetKey, PORT, reasoningKey, lanMode, apiKey, budgetKey, { ctx, kv });
 
   fs.mkdirSync(LOG_DIR, { recursive: true });
   logFile = path.join(LOG_DIR, `shell-${modelId}.log`);
@@ -322,7 +356,14 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey)
     detached: true,
     stdio: ['ignore', out, out],
   });
-  current = { modelId, preset: presetKey, reasoning: reasoningKey || null, budget: budgetKey || null, lanMode: !!lanMode, startedAt: Date.now() };
+  // 记进 current 的是**真正生效**的值,不是界面传进来的意向值 ——
+  // buildArgs() 可能把它吸附到了别的档位、或把非法 KV 键名回落成了默认,
+  // 状态栏必须显示实际值。
+  const ctxIdx = args.indexOf('-c');
+  const effectiveCtx = ctxIdx >= 0 ? Number(args[ctxIdx + 1]) : null;
+  const kIdx = args.indexOf('-ctk');
+  const effectiveKv = kIdx >= 0 ? args[kIdx + 1] : null;
+  current = { modelId, preset: presetKey, reasoning: reasoningKey || null, budget: budgetKey || null, ctx: effectiveCtx, kv: effectiveKv, speed: null, lanMode: !!lanMode, startedAt: Date.now() };
 
   // 记进台账:万一外壳非正常退出,下次启动能靠它把这个进程收掉。
   if (child.pid) writeLedger([child.pid]);
@@ -366,7 +407,11 @@ async function startServer(modelId, presetKey, reasoningKey, lanMode, budgetKey)
     }
   }
 
-  return { url: `${BASE}/`, modelId, preset: presetKey, reasoning: current.reasoning, budget: current.budget, lanMode: current.lanMode };
+  // 探针放最后、且不 await —— 它要花二三十秒建 CUDA 图,不该拖住"启动完成"。
+  // 界面先显示运行中,结果出来后再由 notifyRenderer 补上速度那一行。
+  runProbe(model);
+
+  return { url: `${BASE}/`, modelId, preset: presetKey, reasoning: current.reasoning, budget: current.budget, ctx: current.ctx, kv: current.kv, lanMode: current.lanMode };
 }
 
 // ------------------------------------------------------------------ 渲染层
@@ -408,10 +453,25 @@ ipcMain.handle('catalogue', () => ({
     present: modelExists(m),
     binPresent: binExists(m),
     warn: m.warn || null,
+    // 上下文滑块的边界,按 KV 精度分别给:
+    //   safeCtx  { q4_0: N, q8_0: M } —— 本机实测"不会溢出"的值(见 config.js)
+    //   maxCtx   模型自身声明的上限
+    // safeCtx 比 maxCtx 小,而且随 KV 精度变化(精度越高 KV 越大、装得越少),
+    // 所以整对象传过去,由界面按当前选中的 KV 精度取值 —— 这样拖动 KV 选择器
+    // 时安全区能立刻联动,不需要再走一次 IPC。
+    safeCtx: m.safeCtx || null,
+    maxCtx: m.maxCtx || null,
+    probeTps: m.probeTps || null,
   })),
   presets: Object.entries(PRESETS).map(([k, v]) => ({
     key: k, label: v.label, hint: v.hint, ctx: v.ctx, vision: v.vision,
   })),
+  ctxSteps: CTX_STEPS,
+  kvTypes: KV_TYPES,
+  defaultKv: DEFAULT_KV,
+  // 仅作参考信息:本机观测到的显存分配天花板。**不要**拿它当溢出判据 ——
+  // 溢出的配置和满速的配置显存读数可以完全一样(见 config.js 的说明)。
+  vramCeilingMiB: VRAM_CEILING_MIB,
   reasoning: Object.entries(REASONING).map(([k, v]) => ({
     key: k, label: v.label, hint: v.hint, flag: v.flag,
   })),
@@ -435,6 +495,9 @@ ipcMain.handle('settings:get', () => {
   return {
     apiKey: s.apiKey || '',
     lanMode: !!s.lanMode,
+    // 启动速度探针的开关。默认开 —— 它是唯一能抓出"KV 溢出到内存"的手段,
+    // 而那个故障是静默的。关掉只影响"要不要花几十秒探测",不影响使用。
+    probe: s.probe !== false,
     addresses: localAddresses(PORT),
   };
 });
@@ -443,9 +506,10 @@ ipcMain.handle('settings:set', (_e, patch) => {
   const clean = {};
   if (typeof patch?.apiKey === 'string') clean.apiKey = patch.apiKey.trim();
   if (typeof patch?.lanMode === 'boolean') clean.lanMode = patch.lanMode;
+  if (typeof patch?.probe === 'boolean') clean.probe = patch.probe;
   settings.writeSettings(clean);
   const s = settings.readSettings();
-  return { ok: true, apiKey: s.apiKey || '', lanMode: !!s.lanMode };
+  return { ok: true, apiKey: s.apiKey || '', lanMode: !!s.lanMode, probe: s.probe !== false };
 });
 
 ipcMain.handle('settings:genkey', () => {
@@ -457,9 +521,9 @@ ipcMain.handle('settings:genkey', () => {
 /** 网卡可能中途插拔(开热点就会多一个),所以地址要能刷新。 */
 ipcMain.handle('net:addresses', () => localAddresses(PORT));
 
-ipcMain.handle('start', async (_e, { modelId, preset, reasoning, lanMode, budget }) => {
+ipcMain.handle('start', async (_e, { modelId, preset, reasoning, lanMode, budget, ctx, kv }) => {
   try {
-    const r = await startServer(modelId, preset, reasoning, lanMode, budget);
+    const r = await startServer(modelId, preset, reasoning, lanMode, budget, ctx, kv);
     return { ok: true, ...r };
   } catch (e) {
     return { ok: false, error: e.message };
@@ -495,6 +559,8 @@ ipcMain.handle('status', async () => {
     budget: current.budget,
     lanMode: current.lanMode,
     ctx,
+    kv: current.kv,
+    speed: current.speed,
     uptimeSec: current.startedAt ? Math.floor((Date.now() - current.startedAt) / 1000) : 0,
     url: health.ok ? `${BASE}/` : null,
   };

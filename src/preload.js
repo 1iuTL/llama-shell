@@ -7,9 +7,11 @@ contextBridge.exposeInMainWorld('shell', {
   catalogue: () => ipcRenderer.invoke('catalogue'),
   /** 启动服务。
    *  reasoning 为思考强度键名;lanMode 为 true 时监听 0.0.0.0;
-   *  budget 为思考预算键名(见 catalogue 的 budgets),缺省用默认档。 */
-  start: (modelId, preset, reasoning, lanMode, budget) =>
-    ipcRenderer.invoke('start', { modelId, preset, reasoning, lanMode, budget }),
+   *  budget 为思考预算键名(见 catalogue 的 budgets),缺省用默认档;
+   *  ctx 为上下文 token 数(侧栏滑块)。传 null 表示用预设自带的上下文;
+   *  kv 为 KV cache 精度键名('q4_0' / 'q8_0'),非法值回落到默认。 */
+  start: (modelId, preset, reasoning, lanMode, budget, ctx, kv) =>
+    ipcRenderer.invoke('start', { modelId, preset, reasoning, lanMode, budget, ctx, kv }),
   /** 停止当前服务。 */
   stop: () => ipcRenderer.invoke('stop'),
   /** 查询运行状态(是否在跑 / 上下文 / 运行时长)。 */

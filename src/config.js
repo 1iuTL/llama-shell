@@ -79,6 +79,97 @@ const PROXY_BASE = 'http://127.0.0.1:' + PROXY_PORT;
 
 const MMPROJ = 'D:\\Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf';
 
+// ---------------------------------------------------------------- 上下文滑块
+//
+// 预设里的 ctx 只是**起点**,不是上限。实测(2026-09-26,本机 RTX 5060 Laptop
+// 8GB,q4_0 KV + `-fa on` + `-np 1`):
+//
+//   Bonsai 27B Q1_0   192K -> 7809 MiB / 41.3 tok/s ; 224K -> 静默溢出,6.4 tok/s
+//   Bonsai 2 三元版    96K -> 7865 MiB / 32.6 tok/s ; 128K -> 静默溢出,4.8 tok/s
+//
+// 为什么能开到这么大:两个模型都是 qwen35 **混合注意力**架构 —— block_count=64,
+// 但 full_attention_interval=4,**只有 16 层带 KV cache**,其余 48 层是线性注意力
+// (状态恒定,不随上下文增长)。实测 KV 斜率约 23 MiB / 1K token,
+// 也就是说吃显存的从来是权重,不是上下文。
+//
+// 为什么**必须**给上限:溢出是**静默**的。`-ngl 99` 是用户显式指定的,
+// llama.cpp 于是跳过自动显存适配,只在日志留一行 warning:
+//
+//   W common_fit_params: failed to fit params to free device memory:
+//                        n_gpu_layers already set by user to 99, abort
+//
+// 然后把 KV cache 挪到主机内存、注意力改由 CPU 算 —— 不报错、不退出,
+// 只是慢 8 倍。实测 192K -> 224K 时显存读数几乎没变(7809 -> 7791),
+// 速度却从 41.3 掉到 6.4 tok/s。极容易被误判成"模型不行"或"上下文太长就这样"。
+const CTX_STEPS = [8192, 16384, 32768, 49152, 65536, 98304, 131072, 163840, 196608, 262144];
+
+// 本机观测到的显存分配天花板。卡总容量 8151 MiB,系统桌面约占 300 MiB。
+// (这里接管了原先散落在 PRESETS 里、从未被读取的 budgetMiB 字段。)
+//
+// ⚠ 它**不能**用来判断有没有溢出 —— 这是实测踩到的坑,记下来免得再犯:
+//
+//     三元版 @ 64K + q8_0 : 7869 MiB,但只有  4.9 tok/s   (已溢出到内存)
+//     三元版 @ 96K + q4_0 : 7869 MiB,却有 31.8 tok/s     (满速)
+//
+//   两者显存读数**一模一样**。原因是 KV 漏到主机内存时,llama.cpp 仍会把显存
+//   分配到接近上限,读数反映的是"分配了多少",不是"KV 在不在设备上"。
+//
+// 结论:**唯一可靠的溢出判据是 tok/s,不是显存。** 想加运行时护栏就得测速;
+// 用显存做阈值只会给出假警报。上面每个模型的 safeCtx 也都是按**实测速度**
+// 定的,不是按显存定的 —— 这正是它能分对的原因。
+const VRAM_CEILING_MIB = 7869;
+
+// ------------------------------------------------------------ KV cache 精度
+//
+// KV 量化不是"优化选项",是能不能跑的前提:`-fa on` + `-ctk/-ctv` 是这台
+// 8GB 卡能开到 64K 以上的唯一原因。实测把 KV 从 q4_0 提到 f16,64K 就要
+// ~9727 MiB,直接超出 8151 MiB 可用。
+//
+// 两种精度的取舍(本机实测):
+//
+//              1-bit (3.54GB 权重)      三元版 (5.54GB 权重)
+//   q4_0       192K @ 41 tok/s          96K @ 31 tok/s
+//   q8_0        96K @ 41 tok/s          48K @ 31 tok/s
+//
+// 也就是 **提高精度 = 上下文减半**。而实测两边的输出质量看不出差异
+// (20 次生成,最长同字符连续都在 4-16,无乱码无塌缩),所以默认 q4_0。
+//
+// ⚠ KV 量化**依赖 flash attention**。`-fa off` 时 llama.cpp 会直接报错而不是
+// 静默降级,所以下面 `-fa on` 与 `-ctk/-ctv` 必须成对出现,别单独删一个。
+const KV_TYPES = [
+  { key: 'q4_0', label: 'q4_0', hint: 'KV 压到约 1/4,上下文最大(推荐)' },
+  { key: 'q8_0', label: 'q8_0', hint: 'KV 精度更高,但上下文减半' },
+];
+const DEFAULT_KV = 'q4_0';
+
+/** 取某个模型在指定 KV 精度下"实测不会溢出"的上下文。 */
+function safeCtxFor(model, kv) {
+  if (!model || !model.safeCtx) return null;
+  if (typeof model.safeCtx === 'number') return model.safeCtx;   // 兼容旧写法
+  const key = KV_TYPES.some((k) => k.key === kv) ? kv : DEFAULT_KV;
+  return model.safeCtx[key] || null;
+}
+
+/** 把 KV 精度键名收敛成合法值。 */
+function resolveKv(kv) {
+  return KV_TYPES.some((k) => k.key === kv) ? kv : DEFAULT_KV;
+}
+
+/** 把任意上下文值吸附到最近的合法档位,并夹在 [minCtx, maxCtx] 内。 */
+function snapCtx(value, model) {
+  const max = (model && model.maxCtx) || CTX_STEPS[CTX_STEPS.length - 1];
+  const min = CTX_STEPS[0];
+  const v = Number(value);
+  if (!Number.isFinite(v)) return null;
+  const clamped = Math.min(max, Math.max(min, v));
+  let best = CTX_STEPS[0];
+  for (const s of CTX_STEPS) {
+    if (s > max) break;
+    if (Math.abs(s - clamped) < Math.abs(best - clamped)) best = s;
+  }
+  return best;
+}
+
 // 视觉能力会多占约 0.9 GiB(投影器放内存)外加图片 token,
 // 所以在 8 GB 卡上给它配了更小的上下文。
 const PRESETS = {
@@ -87,28 +178,30 @@ const PRESETS = {
     hint: '64K 上下文,适合读长文档/代码',
     ctx: 65536,
     vision: false,
-    budgetMiB: 8000,
   },
   'text-32k': {
     label: '常规 32K',
     hint: '32K 上下文,显存更宽裕',
     ctx: 32768,
     vision: false,
-    budgetMiB: 8000,
   },
-  'vision-32k': {
-    label: '图片 32K',
+  'vision-64k': {
+    label: '图片 64K',
     hint: '带视觉投影,可传图片',
-    ctx: 32768,
+    // 原为 32K。实测(2026-09-26)视觉**几乎不占显存** —— `--no-mmproj-offload`
+    // 把 0.59 GiB 的投影器留在系统内存,开与不开差 ≈0 MiB:
+    //   64K 开视觉 7274 MiB / 纯文本 29.4 · 带图 22.4 tok/s
+    //   96K 开视觉 7888 MiB / 纯文本 27.2 · 带图 21.8 tok/s
+    // 所以 32K 白白浪费了大半上下文。取 64K 而不是 96K:96K 只剩 263 MiB 余量,
+    // 桌面或别的程序多吃一点就溢出;64K 有 877 MiB 余量。
+    ctx: 65536,
     vision: true,
-    budgetMiB: 8000,
   },
   'quick-8k': {
     label: '轻量 8K',
     hint: '8K 上下文,启动最快',
     ctx: 8192,
     vision: false,
-    budgetMiB: 8000,
   },
 };
 
@@ -150,6 +243,13 @@ const MODELS = [
     file: MODELS_DIR + 'Bonsai-27B-Q1_0.gguf',
     bin: BIN.stock,
     defaultPreset: 'text-64k',
+    // 本机实测:192K 仍满速(7809 MiB / 41.3 tok/s),224K 静默溢出。
+    // 权重只有 3.54 GB,所以它能开最大 —— 三元版给不了。
+    // q8_0 时 96K 满速(7583 MiB / 41.4 tok/s),128K 溢出(4.9 tok/s)。
+    safeCtx: { q4_0: 196608, q8_0: 98304 },
+    maxCtx: 262144,
+    // 启动探针的对照基线(tok/s)。低于它的 60% 判定为"KV 溢出到内存"。
+    probeTps: 41,
   },
   {
     id: 'ternary',
@@ -158,6 +258,13 @@ const MODELS = [
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-PTQ1_0.gguf',
     bin: BIN.prism,
     defaultPreset: 'text-64k',
+    // 本机实测:q4_0 时 96K 满速(7869 MiB / 30-32 tok/s),128K 溢出(4.8 tok/s);
+    //       q8_0 时 48K 满速(7670 MiB / 30-32 tok/s), 64K 溢出(4.9 tok/s)。
+    // 权重 5.54 GB 比 1-bit 多 2 GB,那 2 GB 全是从上下文里扣出来的。
+    safeCtx: { q4_0: 98304, q8_0: 49152 },
+    maxCtx: 262144,
+    // 启动探针的对照基线(tok/s)。
+    probeTps: 31,
   },
   {
     id: 'ternary-heretic',
@@ -166,6 +273,13 @@ const MODELS = [
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Heretic-PTQ1_0.gguf',
     bin: BIN.prism,
     defaultPreset: 'text-64k',
+    // 本机实测:q4_0 时 96K 满速(7869 MiB / 30-32 tok/s),128K 溢出(4.8 tok/s);
+    //       q8_0 时 48K 满速(7670 MiB / 30-32 tok/s), 64K 溢出(4.9 tok/s)。
+    // 权重 5.54 GB 比 1-bit 多 2 GB,那 2 GB 全是从上下文里扣出来的。
+    safeCtx: { q4_0: 98304, q8_0: 49152 },
+    maxCtx: 262144,
+    // 启动探针的对照基线(tok/s)。
+    probeTps: 31,
   },
   {
     id: 'ternary-abliterated',
@@ -174,6 +288,13 @@ const MODELS = [
     file: MODELS_DIR + 'Ternary-Bonsai-2-27B-Abliterated-PTQ1_0.gguf',
     bin: BIN.prism,
     defaultPreset: 'text-64k',
+    // 本机实测:q4_0 时 96K 满速(7869 MiB / 30-32 tok/s),128K 溢出(4.8 tok/s);
+    //       q8_0 时 48K 满速(7670 MiB / 30-32 tok/s), 64K 溢出(4.9 tok/s)。
+    // 权重 5.54 GB 比 1-bit 多 2 GB,那 2 GB 全是从上下文里扣出来的。
+    safeCtx: { q4_0: 98304, q8_0: 49152 },
+    maxCtx: 262144,
+    // 启动探针的对照基线(tok/s)。
+    probeTps: 31,
   },
 
 
@@ -219,22 +340,46 @@ const MODELS = [
  * 检测到 401 会弹一个输入框,校验通过就存进浏览器 localStorage,之后免输。
  * 所以手机只需输一次。注意 / 这个页面本身是放行的(不然连输入框都拿不到),
  * 被挡住的是 /v1/* 与 /props 这些真正的接口。
+ *
+ * ctxOverride 是界面上那个上下文滑块的取值,单位 token。
+ * 传 null / undefined / 空串 => 用预设自带的 ctx(旧行为,完全不变)。
+ * 传具体数字 => 先 snapCtx() 吸附档位并夹到 model.maxCtx,再覆盖预设的 ctx。
+ * 校验放在这里而不是界面里,是因为这是**唯一**能决定 `-c` 的地方 ——
+ * 界面漏校验一次,代价就是用户看到模型莫名变慢 8 倍。
+ *
+ * overrides 是可选覆盖项(第 8 个位置参数,本身就是个对象,方便以后扩展):
+ *   overrides.ctx  上下文 token 数,见上
+ *   overrides.kv   KV cache 精度键名('q4_0' / 'q8_0'),非法值回落到默认
  */
-function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budgetKey) {
+function buildArgs(model, presetKey, port, reasoningKey, lanMode, apiKey, budgetKey, overrides) {
   const preset = PRESETS[presetKey];
   if (!preset) throw new Error('未知的预设: ' + presetKey);
 
   // 没指定、或指定了「跟随模型默认」,都表示不加参数。
   const reasoning = reasoningKey ? REASONING[reasoningKey] : null;
 
+  // 可选覆盖项收进一个对象,而不是继续往参数表尾部堆位置参数 ——
+  // 这个函数本来就已经有 7 个位置参数了,再多两个没人记得住顺序。
+  // 以后加新选项也只动这里,不必改所有调用点。
+  const ctxOverride = overrides ? overrides.ctx : undefined;
+  const kv = resolveKv(overrides ? overrides.kv : undefined);
+
+  // 滑块传来的上下文。吸附到合法档位并夹在模型上限内 —— 这一层是必须的,
+  // 不能让界面直接决定 `-c`,否则一次误拖就是静默溢出(见上面 VRAM_CEILING_MIB)。
+  // 留空则用预设自带的 ctx,保持原有行为不变。
+  const ctx = ctxOverride === null || ctxOverride === undefined || ctxOverride === ''
+    ? preset.ctx
+    : (snapCtx(ctxOverride, model) || preset.ctx);
+
   const args = [
     '-m', model.file,
-    '-c', String(preset.ctx),
+    '-c', String(ctx),
     '-ngl', '99',
+    // -fa on 与下面两行必须成对:KV 量化依赖 flash attention。
     '-fa', 'on',
     '-np', '1',
-    '-ctk', 'q4_0',
-    '-ctv', 'q4_0',
+    '-ctk', kv,
+    '-ctv', kv,
     '--jinja',
     // 官方 model card 明确给出思考模式下的推荐采样,且实测报告的分数都基于这组值:
     //   Temperature 0.7 / Top-p 0.95 / Top-k 20
@@ -290,4 +435,6 @@ module.exports = {
   MODELS, PRESETS, REASONING, REASONING_BUDGETS, DEFAULT_REASONING_BUDGET,
   BIN, MMPROJ, MODELS_DIR, buildArgs, resolveBudget,
   PROXY_PORT, PROXY_BASE,
+  CTX_STEPS, VRAM_CEILING_MIB, snapCtx,
+  KV_TYPES, DEFAULT_KV, safeCtxFor, resolveKv,
 };

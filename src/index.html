@@ -171,6 +171,53 @@
     font-size: 10.5px; line-height: 1.45;
   }
 
+  /* ------------------------------------------------------------ 上下文滑块 */
+  .ctx-head {
+    display: flex; align-items: baseline; justify-content: space-between;
+    margin-bottom: 9px;
+  }
+  .ctx-head .label { margin: 0; }
+  .ctx-val { font-size: 12.5px; font-weight: 600; color: var(--accent); }
+  .ctx-val.over { color: var(--warn); }
+
+  /* 轨道上直接画出"实测安全区"(蓝)与"会静默溢出区"(黄)。
+     为什么画在轨道上而不是下面写行小字:溢出是**没有报错**的,用户只会在
+     若干轮对话之后觉得"怎么突然变慢了"。边界必须在拖之前就看得见。 */
+  #ctxRange {
+    -webkit-appearance: none; appearance: none; width: 100%; height: 7px;
+    border-radius: 4px; outline: none; margin: 2px 0; cursor: pointer;
+    border: 1px solid var(--line);
+    background: linear-gradient(to right,
+      #2b4a7d 0%, #2b4a7d var(--safe, 60%),
+      #4a3a17 var(--safe, 60%), #4a3a17 100%);
+  }
+  #ctxRange::-webkit-slider-thumb {
+    -webkit-appearance: none; appearance: none;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--accent); border: 2px solid #0f1115; cursor: grab;
+  }
+  #ctxRange::-webkit-slider-thumb:active { cursor: grabbing; }
+  #ctxRange::-webkit-slider-thumb:hover { box-shadow: 0 0 0 4px rgba(76,141,255,.18); }
+  .ctx-ticks {
+    display: flex; justify-content: space-between;
+    color: var(--dim); font-size: 10px; margin-top: 6px;
+  }
+  .ctx-note { font-size: 11px; line-height: 1.55; margin-top: 7px; color: var(--dim); }
+  .ctx-note.warn { color: #e8c46a; }
+  .ctx-note b { color: var(--text); }
+
+  /* KV 精度选择器。只有两项,用紧凑的分段控件而不是 .item 大卡片 ——
+     两个大卡片会占掉侧栏近三分之一,而它和下面的上下文滑块是同一件事的两面。 */
+  .seg { display: flex; gap: 6px; }
+  .seg button {
+    flex: 1; padding: 7px 8px; border-radius: 7px; border: 1px solid var(--line);
+    background: var(--panel-2); color: var(--text); font: inherit; font-size: 12px;
+    cursor: pointer; font-weight: 500;
+  }
+  .seg button:hover { border-color: #3a4150; }
+  .seg button.sel { border-color: var(--accent); background: #1e2734; }
+  .seg-note { font-size: 11px; line-height: 1.5; color: var(--dim); margin-top: 6px; }
+
   #controls { padding: 12px 14px; border-top: 1px solid var(--line); }
   button {
     width: 100%; padding: 10px; border-radius: 7px; border: 1px solid var(--line);
@@ -188,6 +235,10 @@
   .row { display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; }
   .row .k { color: var(--dim); }
   .row .v { text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 探针结论。溢出是红色 —— 这一行是唯一能看出"KV 已经在内存里跑"的地方,
+     显存读数看不出这个(溢出与满速的显存占用实测完全一样)。 */
+  .row .v.bad { color: var(--err); font-weight: 600; }
+  .row .v.ok { color: var(--ok); }
   .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--dim); margin-right: 6px; }
   .dot.on { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
   .dot.busy { background: var(--warn); }
@@ -316,6 +367,16 @@
               <code>--reasoning-effort</code>,完全交给聊天界面里那个按对话设置的档位。</span>
           </span>
         </label>
+        <label class="opt" style="padding:4px 0">
+          <input type="checkbox" id="optProbe" />
+          <span class="txt">
+            <b>启动时做速度探针</b>
+            <span>服务就绪后跑一次固定长度的生成,按 tok/s 判断 KV cache 有没有被挤到内存。
+              那个故障是<b>静默</b>的:不报错、显存读数也看不出,只是慢 6-8 倍。
+              探测要建 CUDA 图,约二三十秒,期间占用唯一的槽位 ——
+              但第一条消息本来也要付这笔钱。关掉可省这段时间。</span>
+          </span>
+        </label>
       </div>
     </div>
   </div>
@@ -328,6 +389,27 @@
     <div class="group">
       <div class="label">运行预设</div>
       <div id="presets"></div>
+    </div>
+    <div class="group">
+      <div class="ctx-head">
+        <div class="label">KV cache 精度</div>
+        <div class="ctx-val" id="kvVal">—</div>
+      </div>
+      <div class="seg" id="kvs"></div>
+      <div class="seg-note" id="kvNote"></div>
+    </div>
+    <div class="group">
+      <div class="ctx-head">
+        <div class="label">上下文长度</div>
+        <div class="ctx-val" id="ctxVal">—</div>
+      </div>
+      <input type="range" id="ctxRange" min="0" max="0" step="1" value="0" />
+      <div class="ctx-ticks">
+        <span id="ctxTickMin">8K</span>
+        <span id="ctxTickSafe">—</span>
+        <span id="ctxTickMax">—</span>
+      </div>
+      <div class="ctx-note" id="ctxNote"></div>
     </div>
     <div class="group hidden" id="reasoningGroup">
       <div class="label">思考强度</div>
@@ -347,6 +429,7 @@
   <div id="status">
     <div class="row"><span class="k">状态</span><span class="v"><span id="dot" class="dot"></span><span id="stText">未运行</span></span></div>
     <div class="row"><span class="k">上下文</span><span class="v" id="stCtx">—</span></div>
+    <div class="row"><span class="k">实测速度</span><span class="v" id="stSpeed">—</span></div>
     <div class="row"><span class="k">运行时长</span><span class="v" id="stUp">—</span></div>
     <div class="row"><span class="k">端口</span><span class="v" id="stPort">—</span></div>
   </div>
@@ -391,6 +474,11 @@ let selPreset = null;
 let selReasoning = 'medium';
 // 思考预算键名。默认由主进程给(32K),用户可改成「不限」。
 let selBudget = null;
+// 上下文滑块当前值(token)。null 表示"还没动过滑块",此时用预设自带的 ctx。
+let selCtx = null;
+// KV cache 精度键名。它决定上下文滑块的**安全区上界** —— 精度越高 KV 越大,
+// 同样显存能装下的上下文越少(三元版 q4_0 96K / q8_0 48K)。
+let selKv = null;
 let busy = false;
 let loadedUrl = null;
 let frameFailed = false;
@@ -400,6 +488,8 @@ let SERVICE_RUNNING = false;
 const REASONING_STORE_KEY = 'model-stove.reasoning';
 const SHOW_REASONING_KEY = 'model-stove.showReasoning';
 const BUDGET_STORE_KEY = 'model-stove.budget';
+const CTX_STORE_KEY = 'model-stove.ctx';
+const KV_STORE_KEY = 'model-stove.kv';
 
 // 侧栏的「思考强度」默认隐藏。
 //
@@ -426,6 +516,35 @@ function applyReasoningVisibility() {
   const on = loadShowReasoning();
   $('reasoningGroup').classList.toggle('hidden', !on);
   $('optReasoning').checked = on;
+}
+
+/**
+ * 显示启动探针的实测速度。
+ *
+ * 为什么专门占一行:**显存读数看不出 KV 有没有溢出**。实测这两行:
+ *   三元版 @64K + q8_0 : 7869 MiB,只有  4.9 tok/s  (已溢出到内存)
+ *   三元版 @96K + q4_0 : 7869 MiB,却有 31.8 tok/s  (满速)
+ * 一模一样。所以"变慢了"这件事只能靠速度本身报出来,否则用户只会觉得
+ * 模型忽然不听话了,永远查不到原因。
+ */
+function renderSpeed(sp) {
+  const el = $('stSpeed');
+  if (!el) return;
+  el.classList.remove('bad', 'ok');
+  if (!sp) { el.textContent = '—'; return; }
+  if (sp.pending) { el.textContent = '探测中…'; return; }
+  if (sp.failed || sp.tps == null) { el.textContent = '未取得'; return; }
+  if (sp.spilled) {
+    el.textContent = `${sp.tps} tok/s ⚠ 疑似溢出(基线 ${sp.expected})`;
+    el.classList.add('bad');
+    el.title = '速度只有基线的 ' + Math.round((sp.ratio || 0) * 100) + '%。' +
+      '说明 KV cache 已被挪到内存、注意力改由 CPU 算。' +
+      '把上下文调小,或把 KV 精度换回 q4_0。';
+  } else {
+    el.textContent = `${sp.tps} tok/s`;
+    el.classList.add('ok');
+    el.title = '基线和满速≈' + sp.expected + ' tok/s。';
+  }
 }
 
 function fmtUptime(s) {
@@ -478,7 +597,10 @@ function renderModels() {
       b.onclick = () => {
         selModel = m.id;
         selPreset = m.defaultPreset;
-        renderModels(); renderPresets(); refreshButtons();
+        // 换模型时把滑块交还给预设 —— 各模型的实测安全上限差一倍
+        // (196K vs 96K),沿用旧值很容易一进去就落在黄色区。
+        selCtx = null;
+        renderModels(); renderPresets(); renderCtx(); refreshButtons();
       };
     }
     box.appendChild(b);
@@ -493,7 +615,8 @@ function renderPresets() {
     b.className = 'item' + (p.key === selPreset ? ' sel' : '');
     b.innerHTML = `<div class="t">${p.label}${p.vision ? ' · 视觉' : ''}</div>
       <div class="d">${p.hint}</div>`;
-    b.onclick = () => { selPreset = p.key; renderPresets(); refreshButtons(); };
+    // 点预设把滑块带回该预设的上下文,之后仍可自由拖动微调。
+    b.onclick = () => { selPreset = p.key; selCtx = p.ctx; renderPresets(); renderCtx(); refreshButtons(); };
     box.appendChild(b);
   }
 }
@@ -560,6 +683,163 @@ function loadBudget() {
   return CATALOGUE.defaultBudget || null;
 }
 
+// ---------------------------------------------------------------- 上下文滑块
+
+/** 当前选中的模型对象。滑块的上限由它决定,不是全局常量。 */
+function currentModel() {
+  return (CATALOGUE.models || []).find((m) => m.id === selModel) || null;
+}
+
+/** 当前 KV 精度键名,收敛成 catalogue 里的合法值。 */
+function currentKv() {
+  const list = CATALOGUE.kvTypes || [];
+  return list.some((k) => k.key === selKv) ? selKv : (CATALOGUE.defaultKv || (list[0] && list[0].key) || null);
+}
+
+/**
+ * 当前「模型 + KV 精度」下,本机实测不会溢出的上下文。
+ *
+ * 必须两个一起看:同一个值对 q4_0 安全、对 q8_0 就可能溢出。主进程给的是
+ * 整张表(`safeCtx: { q4_0: …, q8_0: … }`),这里按当前精度取一格 ——
+ * 放在渲染层解析,是为了拖动 KV 选择器时安全区能立刻联动,不必再走一次 IPC。
+ */
+function safeCtxNow() {
+  const m = currentModel();
+  if (!m || !m.safeCtx) return null;
+  if (typeof m.safeCtx === 'number') return m.safeCtx;    // 兼容旧写法
+  return m.safeCtx[currentKv()] || null;
+}
+
+function renderKv() {
+  const box = $('kvs');
+  const list = CATALOGUE.kvTypes || [];
+  const cur = currentKv();
+  // 把解析后的值写回状态,和 renderCtx() 对 selCtx 的做法一致 ——
+  // 否则 selKv 会停在 null,虽然各处都能靠 currentKv() 兜底,
+  // 但"状态是 null、显示是 q4_0"这种不一致迟早会在别处咬人。
+  selKv = cur;
+  box.innerHTML = '';
+  for (const k of list) {
+    const b = document.createElement('button');
+    b.className = k.key === cur ? 'sel' : '';
+    b.textContent = k.label;
+    b.title = k.hint || '';
+    b.onclick = () => {
+      selKv = k.key;
+      saveKv();
+      // 精度一换,安全区就变 —— 上下文那边必须跟着重画,否则会显示错的上界。
+      renderKv(); renderCtx(); refreshButtons();
+    };
+    box.appendChild(b);
+  }
+  const active = list.find((k) => k.key === cur);
+  $('kvVal').textContent = cur || '—';
+  $('kvNote').textContent = active ? active.hint : '';
+}
+
+function saveKv() { try { localStorage.setItem(KV_STORE_KEY, String(selKv)); } catch (e) { /* 忽略 */ } }
+function loadKv() {
+  try {
+    const v = localStorage.getItem(KV_STORE_KEY);
+    if (v) return v;
+  } catch (e) { /* 忽略 */ }
+  return null;
+}
+
+/**
+ * 这个模型可选的上下文档位。
+ *
+ * 从全局 ctxSteps 里筛,并以 maxCtx 为**硬顶** —— 超出的档位干脆不出现。
+ * 比"让用户拖过头再报错"省事:看得见的选项都是能用的。
+ */
+function ctxStepsFor(model) {
+  const all = CATALOGUE.ctxSteps || [8192];
+  if (!model || !model.maxCtx) return all;
+  const list = all.filter((s) => s <= model.maxCtx);
+  return list.length ? list : [all[0]];
+}
+
+function fmtCtx(n) {
+  if (!n) return '—';
+  return n >= 1024 ? Math.round(n / 1024) + 'K' : String(n);
+}
+
+/**
+ * 画滑块,并按当前模型标出「实测安全区」。
+ *
+ * safe 是**本机实测不会溢出**的值,由主进程从 config.js 给 —— 不是这里猜的。
+ * 轨道左侧蓝色 = 安全,safe 右侧黄色 = 会静默溢出到内存。
+ *
+ * 为什么要费劲画这条分界:溢出时 llama.cpp **不报错、不退出**,只是把 KV cache
+ * 挪到主机内存、注意力改由 CPU 算。用户只会觉得"怎么突然变慢了",查不到原因。
+ * 边界必须在拖动之前就看得见。
+ */
+function renderCtx() {
+  const input = $('ctxRange');
+  const model = currentModel();
+  const steps = ctxStepsFor(model);
+  input.min = '0';
+  input.max = String(steps.length - 1);
+  input.step = '1';
+
+  // 当前值吸附到最近的合法档位 —— 换了模型之后,原值可能已经越界。
+  let cur = selCtx;
+  if (cur === null || cur === undefined) {
+    const p = (CATALOGUE.presets || []).find((x) => x.key === selPreset);
+    cur = p ? p.ctx : steps[steps.length - 1];
+  }
+  let idx = 0;
+  for (let i = 0; i < steps.length; i++) {
+    if (Math.abs(steps[i] - cur) < Math.abs(steps[idx] - cur)) idx = i;
+  }
+  input.value = String(idx);
+  selCtx = steps[idx];
+
+  const safe = safeCtxNow() || steps[steps.length - 1];
+  const max = steps[steps.length - 1];
+  const over = selCtx > safe;
+
+  // 安全区占轨道的比例,喂给 CSS 渐变当色标。
+  const span = max - steps[0];
+  const ratio = span > 0 ? (Math.min(safe, max) - steps[0]) / span : 1;
+  input.style.setProperty('--safe', (ratio * 100).toFixed(1) + '%');
+
+  const val = $('ctxVal');
+  val.textContent = fmtCtx(selCtx) + (over ? ' ⚠' : '');
+  val.classList.toggle('over', over);
+
+  $('ctxTickMin').textContent = fmtCtx(steps[0]);
+  $('ctxTickSafe').textContent = safeCtxNow() ? '实测安全 ' + fmtCtx(safe) : '';
+  $('ctxTickMax').textContent = fmtCtx(max);
+
+  const note = $('ctxNote');
+  note.classList.toggle('warn', over);
+  if (!model) {
+    note.textContent = '';
+  } else if (over) {
+    note.innerHTML = `已超过 <b>${currentKv() || ''}</b> 精度下、本机实测的安全上限 ` +
+      `<b>${fmtCtx(safe)}</b>。超过后 KV cache 被挪到内存、注意力改由 CPU 算,` +
+      `<b>速度掉约 6-8 倍而且不报错</b>` +
+      `(实测 224K 时从 41 掉到 6.4 tok/s)。<br />` +
+      `想开更大:把 KV 精度换回 q4_0,或换权重更小的模型。`;
+  } else {
+    note.innerHTML = `这两个模型是<b>混合注意力</b>架构(64 层里只有 16 层带 KV cache),` +
+      `所以上下文比同尺寸普通模型便宜得多 —— 吃显存的从来是权重,不是上下文。` +
+      `<br />提高 KV 精度会让 KV 变大,安全上限随之减半。`;
+  }
+}
+
+function saveCtx() {
+  try { localStorage.setItem(CTX_STORE_KEY, String(selCtx)); } catch (e) { /* 忽略 */ }
+}
+function loadCtx() {
+  try {
+    const v = Number(localStorage.getItem(CTX_STORE_KEY));
+    if (Number.isFinite(v) && v > 0) return v;
+  } catch (e) { /* 忽略 */ }
+  return null;
+}
+
 function refreshButtons() {
   $('btnStart').disabled = busy || !selModel || !selPreset;
   $('btnStart').textContent = busy ? '启动中…' : '启动';
@@ -594,7 +874,9 @@ async function refresh() {
       $('barText').textContent = `${s.modelName || ''} · ${s.preset || ''}` +
         (s.reasoning ? ` · 思考:${reasonLabel(s.reasoning)}` : '');
     }
-    $('stCtx').textContent = s.ctx ? s.ctx.toLocaleString() + ' tokens' : '—';
+    $('stCtx').textContent = (s.ctx ? s.ctx.toLocaleString() + ' tokens' : '—') +
+      (s.kv ? ' · ' + s.kv : '');
+    renderSpeed(s.speed);
     $('stUp').textContent = fmtUptime(s.uptimeSec);
     $('btnStop').disabled = false;
     $('btnReload').disabled = false;
@@ -603,6 +885,7 @@ async function refresh() {
   } else {
     setDot(busy ? 'busy' : '', busy ? '启动中' : '未运行');
     $('stCtx').textContent = '—';
+    renderSpeed(null);
     $('stUp').textContent = '—';
     $('barText').textContent = '未连接';
     $('btnStop').disabled = true;
@@ -683,7 +966,7 @@ async function doStart() {
   const reasoning = loadShowReasoning() ? selReasoning : null;
   // 局域网开关从设置里读,和 API Key 一起生效。
   const lanMode = !!SETTINGS.lanMode;
-  const r = await window.shell.start(selModel, selPreset, reasoning, lanMode, selBudget);
+  const r = await window.shell.start(selModel, selPreset, reasoning, lanMode, selBudget, selCtx, selKv);
   busy = false; refreshButtons();
   if (!r.ok) {
     setDot('err', '启动失败');
@@ -833,6 +1116,8 @@ async function loadSettingsToUi() {
   SETTINGS = await window.shell.getSettings();
   $('inpKey').value = SETTINGS.apiKey || '';
   $('optLan').checked = !!SETTINGS.lanMode;
+  // 主进程缺省返回 true(没设过 = 开),这里如实反映,不要自己再兜一层默认。
+  $('optProbe').checked = SETTINGS.probe !== false;
   renderLan();
 }
 
@@ -1034,7 +1319,9 @@ async function showLogs() {
   if (first) { selModel = first.id; selPreset = first.defaultPreset; }
   selReasoning = loadReasoning();
   selBudget = loadBudget();
-  renderModels(); renderPresets(); renderReasoning(); renderBudgets(); refreshButtons();
+  selCtx = loadCtx();
+  selKv = loadKv();
+  renderModels(); renderPresets(); renderReasoning(); renderBudgets(); renderKv(); renderCtx(); refreshButtons();
   applyReasoningVisibility();
   await loadSettingsToUi();
   await refresh();
@@ -1050,6 +1337,21 @@ async function showLogs() {
     saveShowReasoning(e.target.checked);
     applyReasoningVisibility();
   };
+
+  // 探针开关。存进主进程的设置(不是 localStorage),因为做决定的是主进程。
+  $('optProbe').onchange = async (e) => {
+    const r = await window.shell.setSettings({ probe: e.target.checked });
+    if (r) SETTINGS.probe = r.probe !== false;
+    $('optProbe').checked = SETTINGS.probe;
+  };
+
+  // 上下文滑块。用 input 而不是 change —— 拖动过程中就要看到读数与警告变化,
+  // 松手才更新的话,用户没法判断什么时候越过了安全线。
+  $('ctxRange').addEventListener('input', (e) => {
+    const steps = ctxStepsFor(currentModel());
+    const v = steps[Number(e.target.value)];
+    if (v) { selCtx = v; saveCtx(); renderCtx(); }
+  });
 
   // ---- API Key ----
   $('btnGenKey').onclick = async () => {
